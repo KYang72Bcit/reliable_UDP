@@ -2,27 +2,27 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net"
 	"os"
-	"encoding/json"
-	"time"
-	"io"
 	"strconv"
-	"fmt"
+	"time"
 )
 
 const (
-	args = 3 
+	args = 3
 	maxRetries = 5
 	bufferSize = 512
 )
 
-/** 
- * 00000001 - ACK
- * 00000010 - SYN
- * 00000100 - FIN
- * 00001000 - DATA
+/**
+	* 00000001 - ACK
+	* 00000010 - SYN
+	* 00000100 - FIN
+	* 00001000 - DATA
 **/
 
 const (
@@ -32,11 +32,10 @@ const (
 	FLAG_DATA
 )
 
-type WriterState int
-
+//////////////////define custom packet structure//////////////////////
 type CustomPacket struct {
-	header Header  `json:"header"`
-	data string    `json:"data"`
+	Header Header  `json:"header"`
+	Data string    `json:"data"`
 }
 
 
@@ -46,15 +45,19 @@ type Header struct {
 	Flags byte     `json:"flags"`
 }
 
+/////////////////////////define writer FSM///////////////////////////
+type WriterState int
 type WriterFSM struct {
 	err error
 	currentState WriterState
-	previousState WriterState
 	ip net.IP
 	port int
 	maxRetries int
 	udpcon net.Conn
-	stdinReader *bufio.Reader 
+	stdinReader *bufio.Reader
+	isInputListended bool
+	isResponseListened bool
+	isSendPacketListened bool
 	signalchan chan struct{} //channel for CtrlC signal handling
 	responseChan chan []byte //channel for response handling
 	inputChan chan []byte //channel for input handling
@@ -66,27 +69,27 @@ type WriterFSM struct {
 	data string
 }
 
-
 const (
-	Initilized WriterState = iota
-	ValidateArgs 
-    CreateSocket 
-    HandshakeInit
+	ValidateArgs WriterState = iota
+	CreateSocket
+	HandshakeInit
 	ResendPacket
-    Connected
+	Connected
 	CloseConnection
 	ErrorHandling
 	FatalError
 	Termination
 )
 
-
+/////////////////////define Methods for WriterFSM for state transitions/////////////////////////
 func NewWriterFSM() *WriterFSM {
 	return &WriterFSM{
-		currentState: Initilized,
-		previousState: -1,
+		currentState: ValidateArgs,
 		maxRetries: maxRetries,
 		stdinReader: bufio.NewReader(os.Stdin),
+		isInputListended: false,
+		isResponseListened: false,
+		isSendPacketListened: false,
 		responseChan: make(chan []byte),
 		inputChan: make(chan []byte),
 		errorChan: make(chan error),
@@ -99,10 +102,9 @@ func NewWriterFSM() *WriterFSM {
 	}
 }
 
-
 func (fsm *WriterFSM) ValidateArgsState() WriterState {
-	fsm.previousState = Initilized
 	if (len(os.Args) != args) {
+
 		fsm.err = errors.New("invalid number of arguments, <ip> <port>")
 		return FatalError
 	}
@@ -117,7 +119,6 @@ func (fsm *WriterFSM) ValidateArgsState() WriterState {
 	return CreateSocket
 }
 
-
 func (fsm *WriterFSM) CreateSocketState() WriterState {
 	addr := &net.UDPAddr{IP: fsm.ip, Port: fsm.port}
 	fsm.udpcon, fsm.err = net.DialUDP("udp", nil, addr)
@@ -128,10 +129,12 @@ func (fsm *WriterFSM) CreateSocketState() WriterState {
 }
 
 
-
 func (fsm *WriterFSM) HandshakeInitState() WriterState {
 
-	go fsm.lisenResponse()
+	if !fsm.isResponseListened  {
+		go fsm.listenResponse()
+		fsm.isResponseListened = true
+	}
 
 	_, err := sendPacket(fsm.ack, fsm.seq, FLAG_SYN, fsm.data, fsm.udpcon)
 	if err != nil {
@@ -154,7 +157,7 @@ func (fsm *WriterFSM) HandshakeInitState() WriterState {
 }
 
 
-func (fsm *WriterFSM) ResendPacketState(seq uint32, ack uint32, flags byte, data string, nextState WriterState) WriterState {
+func (fsm *WriterFSM) ResendPacketState(seq uint32, ack uint32, flags byte, data string, currentState WriterState) WriterState {
 
 	for i := 0; i < fsm.maxRetries; i++ {
 		_, err := sendPacket(seq, ack, flags, data, fsm.udpcon)
@@ -166,22 +169,39 @@ func (fsm *WriterFSM) ResendPacketState(seq uint32, ack uint32, flags byte, data
 		select {
 			case responseData := <- fsm.responseChan:
 				if ValidPacket(responseData, FLAG_ACK, fsm.seq) {
-					return nextState
+					switch currentState {
+						case HandshakeInit:
+							return Connected
+						case CloseConnection:
+							return Termination
+						case Connected:
+							return Connected
+						default:
+							return ErrorHandling
+
+					}
 				}
 			case <- timeout.C:
 				continue
-			
+
 		}
 	}
 
 	fsm.err = errors.New("Connection Error")
-	return FatalError	
+	return ErrorHandling
 }
 
 
 func (fsm *WriterFSM) ConnectedState() WriterState {
-	go fsm.readStdin()
-	go fsm.sendPacket()
+	if !fsm.isInputListended {
+		go fsm.readStdin()
+		fsm.isInputListended = true
+	}
+	if !fsm.isSendPacketListened {
+		go fsm.sendPacket()
+		fsm.isSendPacketListened = true
+	}
+
 	for {
 		select{
 			case <- fsm.signalchan:
@@ -190,81 +210,10 @@ func (fsm *WriterFSM) ConnectedState() WriterState {
 				fsm.err = err
 				return ErrorHandling
 			case <-fsm.resendChan:
-				return ResendPacket	
-			
+				return ResendPacket
+
 		}
 	}
-}
-
-
-func (fsm *WriterFSM) readStdin() {
-	inputBuffer := make([]byte, bufferSize)
-	for {
-		n, err := fsm.stdinReader.Read(inputBuffer)
-		if err != nil {
-			if err == io.EOF {
-				fsm.signalchan <- struct{}{}
-				break
-			}
-			fsm.errorChan <- err
-			return	
-		}
-		fsm.inputChan <- inputBuffer[:n]
-
-	}
-}
-
-func (fsm *WriterFSM) sendPacket() {
-
-	for {
-		timer := time.NewTimer(2 * time.Second)
-		select {
-			case input := <- fsm.inputChan:
-				n, err := sendPacket(fsm.ack, fsm.seq, FLAG_DATA, string(input), fsm.udpcon)
-				if err != nil {
-					fsm.errorChan <- err
-					return
-				}
-				fsm.seq += uint32(n)  //increment seq number by number of bytes sent, get ready for next packet
-
-			case response := <- fsm.responseChan:
-				if ValidPacket(response, FLAG_ACK, fsm.seq) {
-					continue
-				}
-
-			case  <- timer.C:
-				fsm.resendChan <- struct{}{}
-				continue
-				
-			case <-fsm.stopChan:
-				return
-			
-		}
-
-	}
-}
-
-func (fsm *WriterFSM) lisenResponse() {
-	
-		for {
-			select {
-				case <- fsm.stopChan:
-					return
-				default:
-					buffer := make ([]byte, bufferSize)
-					n, err := fsm.udpcon.Read(buffer)
-					if err != nil {
-						fsm.err = err
-						return
-					}
-					fsm.responseChan <- buffer[:n]	
-				}		
-			}
-	}
-
-func (fsm *WriterFSM) ErrorHandlingState() WriterState {
-	fmt.Println("Error:", fsm.err)
-	return ResendPacket
 }
 
 func (fsm *WriterFSM) CloseConnectionState() WriterState {
@@ -291,13 +240,136 @@ func (fsm *WriterFSM) CloseConnectionState() WriterState {
 
 }
 
+func (fsm *WriterFSM) ErrorHandlingState() WriterState {
+	switch fsm.err.Error() {
+		case "Sending Error":
+			fsm.currentState = Connected
+			return ResendPacket
+		default:
+			return FatalError
+	}
+}
+
+
+func (fsm *WriterFSM) FatalErrorState() WriterState {
+	fmt.Println("Fatal Error:", fsm.err)
+	return Termination
+}
+
+
+
 func (fsm *WriterFSM)TerminateState() {
 	fsm.stopChan <- struct{}{}
 	fsm.udpcon.Close()
 	fmt.Println("Client Exiting...")
 }
-	
 
+/////////////////////////////run function for WriterFSM////////////////////////////
+func (fsm *WriterFSM) Run() {
+	for {
+		 select{
+		 case  err := <-fsm.errorChan:
+			  fsm.err = err
+			  fsm.currentState = ErrorHandling
+
+		 default:
+			switch fsm.currentState {
+			case ValidateArgs:
+				fsm.currentState = fsm.ValidateArgsState()
+			case CreateSocket:
+				fsm.currentState = fsm.CreateSocketState()
+			case HandshakeInit:
+				fsm.currentState = fsm.HandshakeInitState()
+			case ResendPacket:
+				fsm.currentState = fsm.ResendPacketState(fsm.ack, fsm.seq, FLAG_SYN, fsm.data, fsm.currentState)
+			case Connected:
+				fsm.currentState = fsm.ConnectedState()
+			case CloseConnection:
+				fsm.currentState = fsm.CloseConnectionState()
+			case ErrorHandling:
+				fsm.currentState = fsm.ErrorHandlingState()
+			case FatalError:
+				fsm.currentState = fsm.FatalErrorState()
+			case Termination:
+				fsm.TerminateState()
+			}
+		 }
+
+	}
+}
+
+/////////////////////////go routines for FSM////////////////////////////
+
+func (fsm *WriterFSM) readStdin() {
+
+		for {
+			inputBuffer := make([]byte, bufferSize)
+			n, err := fsm.stdinReader.Read(inputBuffer)
+			if n > 0 {
+				fsm.inputChan <- inputBuffer[:n]
+			}
+			if err != nil {
+				if err == io.EOF {
+					fsm.signalchan <- struct{}{}
+					return
+				}
+				fsm.errorChan <- err
+				return
+			}
+		}
+	}
+
+func (fsm *WriterFSM) sendPacket() {
+
+	for {
+		timer := time.NewTimer(2 * time.Second)
+		select {
+			case input := <- fsm.inputChan:
+				n, err := sendPacket(fsm.ack, fsm.seq, FLAG_DATA, string(input), fsm.udpcon)
+				if err != nil {
+					fsm.resendChan <- struct{}{}
+					continue
+				}
+				fsm.seq += uint32(n)  //increment seq number by number of bytes sent,
+									//get ready for next packet
+			case response := <- fsm.responseChan:
+				if ValidPacket(response, FLAG_ACK, fsm.seq) {
+					continue
+				}
+
+			case  <- timer.C:
+				fsm.resendChan <- struct{}{}
+				continue
+
+			case <-fsm.stopChan:
+				return
+
+		}
+
+	}
+}
+
+func (fsm *WriterFSM) listenResponse() {
+	fsm.udpcon.SetReadDeadline(time.Now().Add(5*time.Second))
+
+		for {
+			select {
+				case <- fsm.stopChan:
+					return
+				default:
+					buffer := make ([]byte, bufferSize)
+					n, err := fsm.udpcon.Read(buffer)
+					if err != nil {
+						fsm.errorChan <- err
+						return
+					}
+					fsm.responseChan <- buffer[:n]
+				}
+			}
+	}
+
+
+////////////////////////////////helper functions///////////////////////////////
 func validateIP(ip string) (net.IP, error){
 	addr := net.ParseIP(ip)
 	if addr == nil {
@@ -316,12 +388,12 @@ func validatePort(port string) (int, error) {
 
 func createPacket(ack uint32, seq uint32, flags byte, data string) ([]byte, error) {
 	packet := CustomPacket{
-		header: Header{
+		Header: Header{
 			SeqNum: seq,
 			AckNum: ack,
 			Flags: flags,
 		},
-		data: data,
+		Data: data,
 
 	}
 	return json.Marshal(packet)
@@ -344,9 +416,8 @@ func ValidPacket(response []byte, flags byte, seq uint32) bool {
 	if err != nil {
 		return false
 	}
-	return header.Flags == flags && header.AckNum == seq 
+	return header.Flags == flags && header.AckNum == seq
 }
-
 
 func processResponse(response []byte) (*Header, string, error) {
 	var packet CustomPacket
@@ -354,42 +425,12 @@ func processResponse(response []byte) (*Header, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
-	return &packet.header, packet.data, nil
+	return &packet.Header, packet.Data, nil
 }
 
-func (fsm *WriterFSM) Run() {
-	for {
-		switch fsm.currentState {
-			case Initilized:
-				fsm.currentState = fsm.ValidateArgsState()
-			case ValidateArgs:
-				fsm.currentState = fsm.CreateSocketState()
-			case CreateSocket:
-				fsm.currentState = fsm.HandshakeInitState()
-			case HandshakeInit:
-				fsm.currentState = fsm.ConnectedState()
-			case ResendPacket:
-				fsm.currentState = fsm.ResendPacketState(fsm.ack, fsm.seq, FLAG_SYN, fsm.data, HandshakeInit)
-			case Connected:
-				fsm.currentState = fsm.ConnectedState()
-			case CloseConnection:
-				fsm.currentState = fsm.CloseConnectionState()
-			case ErrorHandling:
-				fsm.currentState = fsm.ErrorHandlingState()
-			case FatalError:
-				fsm.currentState = fsm.ErrorHandlingState()
-			case Termination:
-				fsm.TerminateState()
-			default:
-				fsm.currentState = FatalError
-		}
-	}
-}
-
+/////////////////////////////main function//////////////////////////////////////
 
 func main() {
 	writerFSM := NewWriterFSM()
 	writerFSM.Run()
-	
 }
-
