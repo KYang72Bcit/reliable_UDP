@@ -9,6 +9,7 @@ import (
 	"time"
 	"io"
 	"strconv"
+	"fmt"
 )
 
 const (
@@ -58,6 +59,7 @@ type WriterFSM struct {
 	inputChan chan []byte //channel for input handling
 	errorChan chan error //channel for error handling
 	resendChan chan struct{} //channel for resend handling
+	stopChan chan struct{} //channel for stop sending handling
 	ack uint32
 	seq uint32
 	data string
@@ -88,6 +90,7 @@ func NewWriterFSM() *WriterFSM {
 		errorChan: make(chan error),
 		resendChan: make(chan struct{}),
 		signalchan: make(chan struct{}),
+		stopChan: make(chan struct{}),
 		ack: 0,
 		seq: 0,
 		data: "",
@@ -228,6 +231,9 @@ func (fsm *WriterFSM) sendPacket() {
 			case  <- timer.C:
 				fsm.resendChan <- struct{}{}
 				continue
+				
+			case <-fsm.stopChan:
+				return
 			
 		}
 
@@ -237,15 +243,20 @@ func (fsm *WriterFSM) sendPacket() {
 func (fsm *WriterFSM) lisenResponse() {
 	
 		for {
-			buffer := make ([]byte, bufferSize)
-			n, err := fsm.udpcon.Read(buffer)
-			if err != nil {
-				fsm.err = err
-				return
+			select {
+				case <- fsm.stopChan:
+					return
+				default:
+					buffer := make ([]byte, bufferSize)
+					n, err := fsm.udpcon.Read(buffer)
+					if err != nil {
+						fsm.err = err
+						return
+					}
+					fsm.responseChan <- buffer[:n]	
+				}		
 			}
-			fsm.responseChan <- buffer[:n]		
 	}
-}
 
 func (fsm *WriterFSM) CloseConnectionState() WriterState {
 
@@ -271,11 +282,13 @@ func (fsm *WriterFSM) CloseConnectionState() WriterState {
 
 }
 
-func (fsm *WriterFSM)TerminateState() WriterState {
+func (fsm *WriterFSM)TerminateState() {
+	fsm.stopChan <- struct{}{}
 	fsm.udpcon.Close()
+	fmt.Println("Client Exiting...")
+}
 	
 
-}
 
 
 func validateIP(ip string) (net.IP, error){
@@ -323,7 +336,6 @@ func ValidPacket(response []byte, flags byte, seq uint32) bool {
 	return true 
 }
 
-//////////////////////////////INPUT FSM///////////////////////////////////////
 
 
 
