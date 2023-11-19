@@ -35,20 +35,21 @@ const (
 type WriterState int
 
 type CustomPacket struct {
-	header Header
-	data string
+	header Header  `json:"header"`
+	data string    `json:"data"`
 }
 
 
 type Header struct {
-	SeqNum uint32
-	AckNum uint32
-	Flags byte
+	SeqNum uint32 `json:"seqNum"`
+	AckNum uint32  `json:"ackNum"`
+	Flags byte     `json:"flags"`
 }
 
 type WriterFSM struct {
 	err error
 	currentState WriterState
+	previousState WriterState
 	ip net.IP
 	port int
 	maxRetries int
@@ -83,6 +84,7 @@ const (
 func NewWriterFSM() *WriterFSM {
 	return &WriterFSM{
 		currentState: Initilized,
+		previousState: -1,
 		maxRetries: maxRetries,
 		stdinReader: bufio.NewReader(os.Stdin),
 		responseChan: make(chan []byte),
@@ -99,6 +101,7 @@ func NewWriterFSM() *WriterFSM {
 
 
 func (fsm *WriterFSM) ValidateArgsState() WriterState {
+	fsm.previousState = Initilized
 	if (len(os.Args) != args) {
 		fsm.err = errors.New("invalid number of arguments, <ip> <port>")
 		return FatalError
@@ -217,11 +220,12 @@ func (fsm *WriterFSM) sendPacket() {
 		timer := time.NewTimer(2 * time.Second)
 		select {
 			case input := <- fsm.inputChan:
-				_, err := sendPacket(fsm.ack, fsm.seq, FLAG_DATA, string(input), fsm.udpcon)
+				n, err := sendPacket(fsm.ack, fsm.seq, FLAG_DATA, string(input), fsm.udpcon)
 				if err != nil {
 					fsm.errorChan <- err
 					return
 				}
+				fsm.seq += uint32(n)  //increment seq number by number of bytes sent, get ready for next packet
 
 			case response := <- fsm.responseChan:
 				if ValidPacket(response, FLAG_ACK, fsm.seq) {
@@ -258,6 +262,11 @@ func (fsm *WriterFSM) lisenResponse() {
 			}
 	}
 
+func (fsm *WriterFSM) ErrorHandlingState() WriterState {
+	fmt.Println("Error:", fsm.err)
+	return ResendPacket
+}
+
 func (fsm *WriterFSM) CloseConnectionState() WriterState {
 
 	_, err := sendPacket(fsm.ack, fsm.seq, FLAG_FIN, "", fsm.udpcon)
@@ -288,8 +297,6 @@ func (fsm *WriterFSM)TerminateState() {
 	fmt.Println("Client Exiting...")
 }
 	
-
-
 
 func validateIP(ip string) (net.IP, error){
 	addr := net.ParseIP(ip)
@@ -333,13 +340,56 @@ func sendPacket(ack uint32, seq uint32, flags byte, data string, udpcon net.Conn
 }
 
 func ValidPacket(response []byte, flags byte, seq uint32) bool {
-	return true 
+	header, _, err := processResponse(response)
+	if err != nil {
+		return false
+	}
+	return header.Flags == flags && header.AckNum == seq 
 }
 
 
+func processResponse(response []byte) (*Header, string, error) {
+	var packet CustomPacket
+	err := json.Unmarshal(response, &packet)
+	if err != nil {
+		return nil, "", err
+	}
+	return &packet.header, packet.data, nil
+}
+
+func (fsm *WriterFSM) Run() {
+	for {
+		switch fsm.currentState {
+			case Initilized:
+				fsm.currentState = fsm.ValidateArgsState()
+			case ValidateArgs:
+				fsm.currentState = fsm.CreateSocketState()
+			case CreateSocket:
+				fsm.currentState = fsm.HandshakeInitState()
+			case HandshakeInit:
+				fsm.currentState = fsm.ConnectedState()
+			case ResendPacket:
+				fsm.currentState = fsm.ResendPacketState(fsm.ack, fsm.seq, FLAG_SYN, fsm.data, HandshakeInit)
+			case Connected:
+				fsm.currentState = fsm.ConnectedState()
+			case CloseConnection:
+				fsm.currentState = fsm.CloseConnectionState()
+			case ErrorHandling:
+				fsm.currentState = fsm.ErrorHandlingState()
+			case FatalError:
+				fsm.currentState = fsm.ErrorHandlingState()
+			case Termination:
+				fsm.TerminateState()
+			default:
+				fsm.currentState = FatalError
+		}
+	}
+}
 
 
 func main() {
+	writerFSM := NewWriterFSM()
+	writerFSM.Run()
 	
 }
 
