@@ -67,6 +67,7 @@ type WriterFSM struct {
 	ack uint32
 	seq uint32
 	data string
+	timeoutDuration time.Duration
 }
 
 const (
@@ -99,6 +100,7 @@ func NewWriterFSM() *WriterFSM {
 		ack: 0,
 		seq: 0,
 		data: "",
+		timeoutDuration: 2 * time.Second,
 	}
 }
 
@@ -141,7 +143,7 @@ func (fsm *WriterFSM) HandshakeInitState() WriterState {
 		fsm.err = err
 		return FatalError
 	}
-	timeout := time.NewTimer(2 * time.Second)
+	timeout := time.NewTimer(fsm.timeoutDuration)
 
 	select {
 		case responseData := <- fsm.responseChan:
@@ -165,7 +167,7 @@ func (fsm *WriterFSM) ResendPacketState(seq uint32, ack uint32, flags byte, data
 			fsm.err = err
 			return FatalError
 		}
-		timeout := time.NewTimer(2 * time.Second)
+		timeout := time.NewTimer(fsm.timeoutDuration)
 		select {
 			case responseData := <- fsm.responseChan:
 				if ValidPacket(responseData, FLAG_ACK, fsm.seq) {
@@ -178,7 +180,6 @@ func (fsm *WriterFSM) ResendPacketState(seq uint32, ack uint32, flags byte, data
 							return Connected
 						default:
 							return ErrorHandling
-
 					}
 				}
 			case <- timeout.C:
@@ -224,7 +225,7 @@ func (fsm *WriterFSM) CloseConnectionState() WriterState {
 		return FatalError
 	}
 
-	timeout := time.NewTimer(2 * time.Second)
+	timeout := time.NewTimer(fsm.timeoutDuration)
 
 	select {
 		case responseData := <- fsm.responseChan:
@@ -322,7 +323,7 @@ func (fsm *WriterFSM) readStdin() {
 func (fsm *WriterFSM) sendPacket() {
 
 	for {
-		timer := time.NewTimer(2 * time.Second)
+		timer := time.NewTimer(fsm.timeoutDuration)
 		select {
 			case input := <- fsm.inputChan:
 				n, err := sendPacket(fsm.ack, fsm.seq, FLAG_DATA, string(input), fsm.udpcon)
