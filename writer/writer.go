@@ -55,15 +55,15 @@ type WriterFSM struct {
 	maxRetries int
 	udpcon net.Conn
 	stdinReader *bufio.Reader
-	isInputListended bool
+	isInputListened bool
 	isResponseListened bool
 	isSendPacketListened bool
 	signalchan chan struct{} //channel for CtrlC signal handling
 	responseChan chan []byte //channel for response handling
 	inputChan chan []byte //channel for input handling
-	errorChan chan error //channel for error handling
+	errorChan chan error //channel for error handling between go routines
 	resendChan chan struct{} //channel for resend handling
-	stopChan chan struct{} //channel for stop sending handling
+	stopChan chan struct{} //channel for notifying go routines to stop
 	ack uint32
 	seq uint32
 	data string
@@ -88,7 +88,7 @@ func NewWriterFSM() *WriterFSM {
 		currentState: ValidateArgs,
 		maxRetries: maxRetries,
 		stdinReader: bufio.NewReader(os.Stdin),
-		isInputListended: false,
+		isInputListened: false,
 		isResponseListened: false,
 		isSendPacketListened: false,
 		responseChan: make(chan []byte),
@@ -147,7 +147,7 @@ func (fsm *WriterFSM) HandshakeInitState() WriterState {
 
 	select {
 		case responseData := <- fsm.responseChan:
-			if ValidPacket(responseData, FLAG_ACK, fsm.seq) {
+			if validPacket(responseData, FLAG_ACK, fsm.seq) {
 				sendPacket(fsm.ack,fsm.seq, FLAG_ACK, fsm.data, fsm.udpcon)
 				return Connected
 			}
@@ -170,7 +170,7 @@ func (fsm *WriterFSM) ResendPacketState(seq uint32, ack uint32, flags byte, data
 		timeout := time.NewTimer(fsm.timeoutDuration)
 		select {
 			case responseData := <- fsm.responseChan:
-				if ValidPacket(responseData, FLAG_ACK, fsm.seq) {
+				if validPacket(responseData, FLAG_ACK, fsm.seq) {
 					switch currentState {
 						case HandshakeInit:
 							return Connected
@@ -194,9 +194,9 @@ func (fsm *WriterFSM) ResendPacketState(seq uint32, ack uint32, flags byte, data
 
 
 func (fsm *WriterFSM) ConnectedState() WriterState {
-	if !fsm.isInputListended {
+	if !fsm.isInputListened {
 		go fsm.readStdin()
-		fsm.isInputListended = true
+		fsm.isInputListened = true
 	}
 	if !fsm.isSendPacketListened {
 		go fsm.sendPacket()
@@ -229,7 +229,7 @@ func (fsm *WriterFSM) CloseConnectionState() WriterState {
 
 	select {
 		case responseData := <- fsm.responseChan:
-			if ValidPacket(responseData, FLAG_FIN, fsm.seq) {
+			if validPacket(responseData, FLAG_FIN, fsm.seq) {
 				sendPacket(fsm.ack,fsm.seq, FLAG_ACK, "", fsm.udpcon)
 				return Termination
 			}
@@ -334,7 +334,7 @@ func (fsm *WriterFSM) sendPacket() {
 				fsm.seq += uint32(n)  //increment seq number by number of bytes sent,
 									//get ready for next packet
 			case response := <- fsm.responseChan:
-				if ValidPacket(response, FLAG_ACK, fsm.seq) {
+				if validPacket(response, FLAG_ACK, fsm.seq) {
 					continue
 				}
 
@@ -351,7 +351,7 @@ func (fsm *WriterFSM) sendPacket() {
 }
 
 func (fsm *WriterFSM) listenResponse() {
-	fsm.udpcon.SetReadDeadline(time.Now().Add(5*time.Second))
+	fsm.udpcon.SetReadDeadline(time.Now().Add(fsm.timeoutDuration))
 
 		for {
 			select {
@@ -412,7 +412,7 @@ func sendPacket(ack uint32, seq uint32, flags byte, data string, udpcon net.Conn
 
 }
 
-func ValidPacket(response []byte, flags byte, seq uint32) bool {
+func validPacket(response []byte, flags byte, seq uint32) bool {
 	header, _, err := processResponse(response)
 	if err != nil {
 		return false
