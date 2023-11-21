@@ -23,6 +23,9 @@
 #define UNKNOWN_OPTION_MESSAGE_LEN 24
 #define BASE_TEN 10
 #define BUFFER_SIZE 1024
+#define GUI_IP "127.0.0.1" // Replace with the IP of the machine running the Python GUI
+#define GUI_PORT 65432     // Replace with the port on which the Python GUI is listening
+
 
 volatile sig_atomic_t signal_received = 0;
 
@@ -79,6 +82,7 @@ static void drop_or_delay(ProxyData *proxy_data);
 static void forward_data(ProxyData *proxy_data, const char *data, size_t data_len);
 static void forward_ack(ProxyData *proxy_data, const char *data, size_t data_len);
 static void store_statistics(const char *filename, Statistics *stats);
+static void send_statistics(ProxyData *proxy_data);
 static void cleanup(ProxyData *proxy_data);
 static void socket_close(int sockfd);
 
@@ -388,7 +392,6 @@ static void *idle_handler(void *arg) {
     return NULL;
 }
 
-
 // Thread function for handling acknowledgment packets
 static void *ack_handler(void *arg) {
     ProxyData *proxy_data = (ProxyData *)arg;
@@ -409,7 +412,6 @@ static void *ack_handler(void *arg) {
 
     return NULL;
 }
-
 
 // Thread function for handling data
 static void *data_handler(void *arg) {
@@ -527,6 +529,45 @@ static void store_statistics(const char *filename, Statistics *stats) {
   fclose(file);
 }
 
+static void send_statistics(ProxyData *proxy_data) {
+    int gui_sockfd;
+    struct sockaddr_storage gui_addr;
+
+    // Convert GUI address
+    convert_address(GUI_IP, &gui_addr);
+
+    // Determine socket type (IPv4 or IPv6) and set port
+    if (gui_addr.ss_family == AF_INET) {
+        ((struct sockaddr_in*)&gui_addr)->sin_port = htons(GUI_PORT);
+    } else if (gui_addr.ss_family == AF_INET6) {
+        ((struct sockaddr_in6*)&gui_addr)->sin6_port = htons(GUI_PORT);
+    } else {
+        fprintf(stderr, "Unsupported address family\n");
+        exit(EXIT_FAILURE);
+    }
+
+    // Create socket
+    gui_sockfd = socket(gui_addr.ss_family, SOCK_DGRAM, 0);
+    if (gui_sockfd < 0) {
+        perror("Failed to create socket");
+        exit(EXIT_FAILURE);
+    }
+
+    // Convert statistics to a string format
+    char stats_buffer[1024];
+    snprintf(stats_buffer, sizeof(stats_buffer), "%lu,%lu", proxy_data->stats->packets_sent, proxy_data->stats->packets_received);
+
+    // Send the statistics
+    socklen_t addr_len = (gui_addr.ss_family == AF_INET) ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
+    if (sendto(gui_sockfd, stats_buffer, strlen(stats_buffer), 0, (struct sockaddr *)&gui_addr, addr_len) < 0) {
+        perror("Failed to send statistics");
+        exit(EXIT_FAILURE);
+    }
+
+    // Close the socket
+    close(gui_sockfd);
+}
+
 // Function to perform cleanup, particularly closing sockets
 static void cleanup(ProxyData *proxy_data) {
     if (proxy_data->writer_sockfd != -1) {
@@ -538,7 +579,6 @@ static void cleanup(ProxyData *proxy_data) {
         proxy_data->receiver_sockfd = -1;
     }
 }
-
 
 // Function to close a socket
 static void socket_close(int sockfd) {
