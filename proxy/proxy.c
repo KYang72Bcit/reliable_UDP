@@ -28,8 +28,8 @@ typedef enum {
   THREAD_CREATE,
   THREAD_JOIN,
   IDLE,
-  PROCESS_PACKET,
-  FORWARD_PACKET,
+  PROCESS_PACKET_OR_ACK,
+  FORWARD_PACKET_OR_ACK,
   CLEAN_UP,
   HANDLE_ERROR
 } ProxyState;
@@ -78,6 +78,7 @@ static void *incoming_handler(void *arg);
 static void *resend_handler(void *arg);
 static void *ack_handler(void *arg);
 static void store_statistics(const char *filename, Statistics *stats);
+static int wait_packets_and_acks(ProxyData *proxy_data);
 
 // Main function
 int main(int argc, char *argv[]) {
@@ -141,12 +142,14 @@ static void transition(FSM *fsm) {
     fsm->currentState = IDLE;
     break;
   case IDLE:
-    // Placeholder for the idle state
+    if (wait_packets_and_acks(&fsm->proxy_data)) {
+        
+    }
     break;
-  case PROCESS_PACKET:
+  case PROCESS_PACKET_OR_ACK:
     // Placeholder for processing packet
     break;
-  case FORWARD_PACKET:
+  case FORWARD_PACKET_OR_ACK:
     // Placeholder for forwarding packet
     break;
   case CLEAN_UP:
@@ -190,6 +193,23 @@ static void store_statistics(const char *filename, Statistics *stats) {
   fprintf(file, "Packets Received: %lu\n", stats->packets_received);
 
   fclose(file);
+}
+
+static int wait_packets_and_acks(ProxyData *proxy_data) {
+    struct pollfd fds[2];
+    // Store return value
+    int ret;
+    // File descriptor for packets
+    fds[0].fd = proxy_data->sockfd;
+    fds[0].events = POLLIN;
+    // Wait for packets and acks
+    ret = poll(fds, 1, -1);
+    if (ret == - 1) {
+        perror("poll");
+        exit(EXIT_FAILURE);
+    }
+    // Check if data is available
+    return (fds[0].revents & POLLIN) ? 1 : 0;
 }
 
 // Function to parse command-line arguments
