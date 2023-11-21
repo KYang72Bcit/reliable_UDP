@@ -3,6 +3,8 @@
         "array": "c",
         "string": "c",
         "string_view": "c",
-        "socket.h": "c"
+        "socket.h": "c",
+        "time.h": "c",
+        "stat.h": "c"
     }
 }
