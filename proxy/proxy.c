@@ -26,7 +26,6 @@
 #define GUI_IP "127.0.0.1" // Replace with the IP of the machine running the Python GUI
 #define GUI_PORT 65432     // Replace with the port on which the Python GUI is listening
 
-
 volatile sig_atomic_t signal_received = 0;
 
 // Enum for FSM states
@@ -406,7 +405,6 @@ static void *ack_handler(void *arg) {
         if (proxy_data->delay_ack_decision) {
             sleep(5);
         }
-
         receive_ack(proxy_data);
     }
 
@@ -453,7 +451,6 @@ static void receive_data(ProxyData *proxy_data) {
         forward_data(proxy_data, buffer, numBytes);
     }
 }
-
 
 // Function to indefinitely listen for ack sent from the receiver
 static void receive_ack(ProxyData *proxy_data) {
