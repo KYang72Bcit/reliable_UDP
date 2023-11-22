@@ -8,9 +8,9 @@ Reliable UDP Protocol Project
 - Indefinitely listen for ack from the receiver
 - Takes the % chance to drop data, drop acks, delay data, and delay acks on the command line
 - The delay is handled with fixed numbers
-- Forwards the ack to writer after it has determined to either forward or drop or delay and forward the ack
-- Forwards the data to receiver after it has determined to either forward or drop or delay and forward the data
-- Maintains a list of statistics showing how many packets have been sent and received
+- Forwards the ack to the writer after it has determined to either forward or drop or delay and forward the ack
+- Forwards the data to the receiver after it has determined to either forward or drop or delay and forward the data
+- Maintains a list of statistics showing how many data and acks have been sent and received, dropped and delayed
 - Stores the list of statistics in a file
 - Terminates if writer and receiver programs are terminated
 
