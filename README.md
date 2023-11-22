@@ -1,5 +1,5 @@
 # Reliable_UDP
-## Reliable UDP Protocol Project
+Reliable UDP Protocol Project
 
 ### Proxy (C)
 - Sits between the writer and the receiver
