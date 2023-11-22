@@ -59,8 +59,7 @@ typedef struct {
 } ProxyData;
 
 typedef struct {
-    unsigned long packets_sent;        
-    unsigned long packets_received;       
+    unsigned long data_sent, data_received, data_dropped, data_delayed, ack_sent, ack_received, ack_dropped, ack_delayed;         
     pthread_mutex_t stats_mutex;   
 } Statistics;
 
@@ -391,7 +390,7 @@ static void *idle_handler(void *arg) {
     return NULL;
 }
 
-// Thread function for handling acknowledgment packets
+// Thread function for handling acknowledgment
 static void *ack_handler(void *arg) {
     ProxyData *proxy_data = (ProxyData *)arg;
 
@@ -442,11 +441,11 @@ static void receive_data(ProxyData *proxy_data) {
         if (numBytes < 0) {
             perror("recvfrom failed");
             continue;
+        } else {
+            pthread_mutex_lock(&proxy_data->stats->stats_mutex);
+            proxy_data->stats->data_received++;
+            pthread_mutex_unlock(&proxy_data->stats->stats_mutex);
         }
-
-        pthread_mutex_lock(&proxy_data->stats->stats_mutex);
-        proxy_data->stats->packets_received++;
-        pthread_mutex_unlock(&proxy_data->stats->stats_mutex);
 
         forward_data(proxy_data, buffer, numBytes);
     }
@@ -464,6 +463,10 @@ static void receive_ack(ProxyData *proxy_data) {
         if (numBytes < 0) {
             perror("recvfrom failed");
             continue;
+        } else {
+            pthread_mutex_lock(&proxy_data->stats->stats_mutex);
+            proxy_data->stats->ack_received++;
+            pthread_mutex_unlock(&proxy_data->stats->stats_mutex);
         }
 
         forward_ack(proxy_data, buffer, numBytes);
@@ -478,6 +481,27 @@ static void drop_or_delay(ProxyData *proxy_data) {
     proxy_data->drop_ack_decision = (rand() % 100 < proxy_data->drop_ack_chance * 100);
     proxy_data->delay_data_decision = (rand() % 100 < proxy_data->delay_data_chance * 100);
     proxy_data->delay_ack_decision = (rand() % 100 < proxy_data->delay_ack_chance * 100);
+
+    if (proxy_data->drop_data_decision) {
+        pthread_mutex_lock(&proxy_data->stats->stats_mutex);
+        proxy_data->stats->data_dropped++;
+        pthread_mutex_unlock(&proxy_data->stats->stats_mutex);
+    }
+    if (proxy_data->delay_data_decision) {
+        pthread_mutex_lock(&proxy_data->stats->stats_mutex);
+        proxy_data->stats->data_delayed++;
+        pthread_mutex_unlock(&proxy_data->stats->stats_mutex);
+    }
+    if (proxy_data->drop_ack_decision) {
+        pthread_mutex_lock(&proxy_data->stats->stats_mutex);
+        proxy_data->stats->ack_dropped++;
+        pthread_mutex_unlock(&proxy_data->stats->stats_mutex);
+    }
+    if (proxy_data->delay_ack_decision) {
+        pthread_mutex_lock(&proxy_data->stats->stats_mutex);
+        proxy_data->stats->ack_delayed++;
+        pthread_mutex_unlock(&proxy_data->stats->stats_mutex);
+    }
 }
 
 // Forward data to the receiver
@@ -498,7 +522,7 @@ static void forward_data(ProxyData *proxy_data, const char *data, size_t data_le
         receive_data(proxy_data);
     } else {
         pthread_mutex_lock(&proxy_data->stats->stats_mutex);
-        proxy_data->stats->packets_received++;
+        proxy_data->stats->data_sent++;
         pthread_mutex_unlock(&proxy_data->stats->stats_mutex);
     }
 }
@@ -509,6 +533,10 @@ static void forward_ack(ProxyData *proxy_data, const char *ack_data, size_t ack_
         perror("Failed to send acknowledgement");
         fprintf(stderr, "Error sending acknowledgement: %s\n", strerror(errno));
         receive_ack(proxy_data);
+    } else {
+        pthread_mutex_lock(&proxy_data->stats->stats_mutex);
+        proxy_data->stats->ack_sent++;
+        pthread_mutex_unlock(&proxy_data->stats->stats_mutex);
     }
 }
 
@@ -520,8 +548,14 @@ static void store_statistics(const char *filename, Statistics *stats) {
     return;
   }
   
-  fprintf(file, "packets Sent: %lu\n", stats->packets_sent);
-  fprintf(file, "packets Received: %lu\n", stats->packets_received);
+    fprintf(file, "Data Sent: %lu\n", stats->data_sent);
+    fprintf(file, "Data Received: %lu\n", stats->data_received);
+    fprintf(file, "Data Dropped: %lu\n", stats->data_dropped);
+    fprintf(file, "Data Delayed: %lu\n", stats->data_delayed);
+    fprintf(file, "Ack Sent: %lu\n", stats->ack_sent);
+    fprintf(file, "Ack Received: %lu\n", stats->ack_received);
+    fprintf(file, "Ack Dropped: %lu\n", stats->ack_dropped);
+    fprintf(file, "Ack Delayed: %lu\n", stats->ack_delayed);
 
   fclose(file);
 }
@@ -543,10 +577,18 @@ static void send_statistics(ProxyData *proxy_data) {
         exit(EXIT_FAILURE);
     }
 
-    // Create socket
-    gui_sockfd = socket(gui_addr.ss_family, SOCK_DGRAM, 0);
+    // Create TCP socket
+    gui_sockfd = socket(gui_addr.ss_family, SOCK_STREAM, 0);
     if (gui_sockfd < 0) {
         perror("Failed to create socket");
+        exit(EXIT_FAILURE);
+    }
+
+    // Connect the socket to the GUI server
+    if (connect(gui_sockfd, (struct sockaddr *)&gui_addr,
+                gui_addr.ss_family == AF_INET ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6)) < 0) {
+        perror("Connect failed");
+        close(gui_sockfd);
         exit(EXIT_FAILURE);
     }
 
@@ -555,15 +597,16 @@ static void send_statistics(ProxyData *proxy_data) {
     snprintf(stats_buffer, sizeof(stats_buffer), "%lu,%lu", proxy_data->stats->packets_sent, proxy_data->stats->packets_received);
 
     // Send the statistics
-    socklen_t addr_len = (gui_addr.ss_family == AF_INET) ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
-    if (sendto(gui_sockfd, stats_buffer, strlen(stats_buffer), 0, (struct sockaddr *)&gui_addr, addr_len) < 0) {
+    if (send(gui_sockfd, stats_buffer, strlen(stats_buffer), 0) < 0) {
         perror("Failed to send statistics");
+        close(gui_sockfd);
         exit(EXIT_FAILURE);
     }
 
     // Close the socket
     close(gui_sockfd);
 }
+
 
 // Function to perform cleanup, particularly closing sockets
 static void cleanup(ProxyData *proxy_data) {
