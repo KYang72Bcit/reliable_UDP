@@ -53,7 +53,7 @@ type WriterFSM struct {
 	ip net.IP
 	port int
 	maxRetries int
-	udpcon net.Conn
+	udpcon *net.UDPConn
 	stdinReader *bufio.Reader
 	isInputListened bool
 	isResponseListened bool
@@ -73,7 +73,8 @@ type WriterFSM struct {
 const (
 	ValidateArgs WriterState = iota
 	CreateSocket
-	HandshakeInit
+	HandShakeSYNState
+	HandShakeACKState
 	ResendPacket
 	Connected
 	CloseConnection
@@ -127,8 +128,42 @@ func (fsm *WriterFSM) CreateSocketState() WriterState {
 	if fsm.err != nil {
 		return FatalError
 	}
-	return HandshakeInit
+	if !fsm.isResponseListened  {
+		go fsm.listenResponse()
+		fsm.isResponseListened = true
+	}
+	return HandShakeSYNState
 }
+
+func (fsm *WriterFSM)HandShakeSYNState() WriterState {
+	_, err := sendPacket (fsm.ack, fsm.seq, FLAG_SYN, fsm.data, fsm.udpcon)
+	if err != nil {
+		return ResendPacket
+	}
+	timeout := time.NewTimer(fsm.timeoutDuration)
+	select {
+		case responseData := <- fsm.responseChan:
+			if validPacket(responseData, FLAG_ACK|FLAG_SYN, fsm.seq) {
+				return HandShakeACKState
+			}
+		case <- timeout.C:{
+			return ResendPacket
+		}
+	}
+	fsm.err = errors.New("Connection Error")
+	return FatalError
+
+}
+
+func (fsm *WriterFSM)HandShakeACKState() WriterState {
+	_, err := sendPacket(fsm.ack, fsm.seq, FLAG_ACK, fsm.data, fsm.udpcon)
+	if err != nil {
+		return ResendPacket
+	}
+
+	return Connected
+}
+ 
 
 
 func (fsm *WriterFSM) HandshakeInitState() WriterState {
@@ -147,8 +182,11 @@ func (fsm *WriterFSM) HandshakeInitState() WriterState {
 
 	select {
 		case responseData := <- fsm.responseChan:
-			if validPacket(responseData, FLAG_ACK, fsm.seq) {
+			if validPacket(responseData, FLAG_ACK|FLAG_SYN, fsm.seq) {
 				sendPacket(fsm.ack,fsm.seq, FLAG_ACK, fsm.data, fsm.udpcon)
+
+			}
+			if validPacket(responseData, FLAG_ACK, fsm.seq) {
 				return Connected
 			}
 		case <- timeout.C:
@@ -413,20 +451,20 @@ func sendPacket(ack uint32, seq uint32, flags byte, data string, udpcon net.Conn
 }
 
 func validPacket(response []byte, flags byte, seq uint32) bool {
-	header, _, err := processResponse(response)
+	header,  err := parsePacket(response)
 	if err != nil {
 		return false
 	}
 	return header.Flags == flags && header.AckNum == seq
 }
 
-func processResponse(response []byte) (*Header, string, error) {
+func parsePacket(response []byte) (*Header,  error) {
 	var packet CustomPacket
 	err := json.Unmarshal(response, &packet)
 	if err != nil {
-		return nil, "", err
+		return nil,  err
 	}
-	return &packet.Header, packet.Data, nil
+	return &packet.Header, nil
 }
 
 /////////////////////////////main function//////////////////////////////////////
