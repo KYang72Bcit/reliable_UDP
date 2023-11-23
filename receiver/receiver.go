@@ -50,10 +50,8 @@ type ReceiverState int
 const (
 	ValidateArgs ReceiverState = iota
 	CreateSocket
-	HandshakeInit
-	Connected
-	SendPacket
-	ResendPacket
+	ReadyForReceiving
+	Receiving
 	HandleError
 	FatalError
 	Termination
@@ -114,8 +112,40 @@ func (fsm *ReceiverFSM) CreateSocketState() ReceiverState {
 		return FatalError
 	}
 	fmt.Println("UDP server listening on", fsm.udpcon.LocalAddr().String())
-	return HandshakeInit
+	return ReadyForReceiving
 }
+
+func (fsm *ReceiverFSM) ReadyForReveivingState() ReceiverState {
+	go fsm.printToConsole()
+	go fsm.listenResponse()
+	go fsm.sendAck()
+	return Receiving
+
+}
+
+/////////////////////////go routine ////////////////////////
+
+////go routine for listening to incoming packets
+
+func (fsm *ReceiverFSM) listenResponse() {
+
+}
+
+
+////go routine for send ack///////////
+
+func (fsm *ReceiverFSM) sendAck() {
+
+}
+
+//////go routine for printing to the console /////////
+
+func (fsm *ReceiverFSM) printToConsole() {
+
+}
+
+
+
 
 func (fsm *ReceiverFSM) HandshakeInitState() ReceiverState {
 	if !fsm.isResponseListened  {

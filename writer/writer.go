@@ -151,8 +151,6 @@ func (fsm *WriterFSM) TransmittingState() WriterState {
 }
 
 
-
-
 func (fsm *WriterFSM) ErrorHandlingState() WriterState {
 		fmt.Println("Error:", fsm.err)
 		fsm.stopChan <- struct{}{}
