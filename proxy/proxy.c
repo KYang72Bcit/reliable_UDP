@@ -14,12 +14,12 @@
 #include <time.h>
 #include <errno.h>
 #include <getopt.h>
-#include <fcntl.h>       
+#include <fcntl.h>      
 #include <sys/select.h>  
 #include <stdbool.h>
 #include <signal.h>
 
-// Define constants 
+// Define constants
 #define UNKNOWN_OPTION_MESSAGE_LEN 24
 #define BASE_TEN 10
 #define BUFFER_SIZE 1024
@@ -43,10 +43,10 @@ typedef enum {
 typedef struct {
     ProxyState currentState;
     int argc;
-    char **argv, *receiver_ip, *receiver_port, *writer_port;
+    char **argv, *receiver_ip, receiver_port, writer_port;
     in_port_t port;                    
-    struct sockaddr_storage addr;       
-    pthread_t t_idle, t_data, t_ack; 
+    struct sockaddr_storage addr;      
+    pthread_t t_idle, t_data, t_ack;
     ProxyData proxy_data;  
 } FSM;
 
@@ -59,8 +59,8 @@ typedef struct {
 } ProxyData;
 
 typedef struct {
-    unsigned long data_sent, data_received, data_dropped, data_delayed, ack_sent, ack_received, ack_dropped, ack_delayed;         
-    pthread_mutex_t stats_mutex;   
+    unsigned long data_sent, data_received, data_dropped, data_delayed, ack_sent, ack_received, ack_dropped, ack_delayed;        
+    pthread_mutex_t stats_mutex;  
 } Statistics;
 
 static void parse_arguments(FSM *fsm, ProxyData *proxy_data);
@@ -85,13 +85,13 @@ static void cleanup(ProxyData *proxy_data);
 static void socket_close(int sockfd);
 
 int main(int argc, char *argv[]) {
-    FSM fsm; 
-    fsm.currentState = INITIALIZE; 
+    FSM fsm;
+    fsm.currentState = INITIALIZE;
     fsm.argc = argc;              
     fsm.argv = argv;              
-    Statistics stats = {0, 0, PTHREAD_MUTEX_INITIALIZER}; 
+    Statistics stats = {0, 0, PTHREAD_MUTEX_INITIALIZER};
     ProxyData proxy_data = {0};    
-    proxy_data.stats = &stats;     
+    proxy_data.stats = &stats;    
 
     // Check for minimum required arguments
     if (argc < 8) {
@@ -99,12 +99,24 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
+    transition(&fsm, &proxy_data);
+
     // Register signal handler, Handle Ctrl+C
     signal(SIGINT, handle_signal);  
     // Handle termination signal
-    signal(SIGTERM, handle_signal); 
+    signal(SIGTERM, handle_signal);
 
-    cleanup(&proxy_data); 
+    // Generate file name with timestamp for statistics
+    char filename[256];
+    time_t now = time(NULL);
+    struct tm *tm_info = localtime(&now);
+    strftime(filename, sizeof(filename), "proxy_stats_%Y%m%d_%H%M%S.txt", tm_info);
+
+    // Call store_statistics here before cleanup
+    store_statistics(filename, &stats);
+
+    // Existing cleanup call
+    cleanup(&proxy_data);
 
     return fsm.currentState == CLEAN_UP ? EXIT_SUCCESS : EXIT_FAILURE;
 }
@@ -141,8 +153,8 @@ static void parse_arguments(FSM *fsm, ProxyData *proxy_data) {
     }
 
     *fsm->receiver_ip = fsm->argv[optind];
-    *fsm->receiver_port = parse_in_port_t(fsm->argv[0], fsm->argv[optind + 1]);
-    *fsm->writer_port = parse_in_port_t(fsm->argv[0], fsm->argv[optind + 2]);
+    fsm->receiver_port = parse_in_port_t(fsm->argv[0], fsm->argv[optind + 1]);
+    fsm->writer_port = parse_in_port_t(fsm->argv[0], fsm->argv[optind + 2]);
     proxy_data->drop_data_chance = atof(fsm->argv[optind + 3]);
     proxy_data->drop_ack_chance = atof(fsm->argv[optind + 4]);
     proxy_data->delay_data_chance = atof(fsm->argv[optind + 5]);
@@ -288,7 +300,7 @@ static void transition(FSM *fsm, ProxyData *proxy_data) {
   switch(fsm->currentState) {
   case INITIALIZE:
     // Parse and handle arguments to set receiver IP and ports
-    parse_arguments(fsm, proxy_data); 
+    parse_arguments(fsm, proxy_data);
     handle_arguments(fsm, fsm->proxy_data);
     fsm->currentState = SOCKET_CREATE;
     break;
@@ -351,7 +363,7 @@ static void *idle_handler(void *arg) {
 
     fcntl(proxy_data->writer_sockfd, F_SETFL, O_NONBLOCK);
     fcntl(proxy_data->receiver_sockfd, F_SETFL, O_NONBLOCK);
-    
+   
     while (1) {
         FD_ZERO(&readfds);
 
@@ -359,7 +371,7 @@ static void *idle_handler(void *arg) {
         FD_SET(proxy_data->receiver_sockfd, &readfds);
         max_sd = (proxy_data->writer_sockfd > proxy_data->receiver_sockfd) ? proxy_data->writer_sockfd : proxy_data->receiver_sockfd;
 
-        timeout.tv_sec = 1; 
+        timeout.tv_sec = 1;
         timeout.tv_usec = 0;
 
         int activity = select(max_sd + 1, &readfds, NULL, NULL, &timeout);
@@ -415,7 +427,7 @@ static void *data_handler(void *arg) {
     ProxyData *proxy_data = (ProxyData *)arg;
 
     while (1) {
-        drop_or_delay(proxy_data); 
+        drop_or_delay(proxy_data);
 
         if (proxy_data->drop_data_decision) {
             continue;
@@ -542,12 +554,25 @@ static void forward_ack(ProxyData *proxy_data, const char *ack_data, size_t ack_
 
 // Function to store data statistics in a file
 static void store_statistics(const char *filename, Statistics *stats) {
-  FILE *file = fopen(filename, "w");
-  if (file == NULL) {
-    perror("Failed to open statistics file");
-    return;
-  }
-  
+    FILE *file = NULL;
+    int attempts = 0;
+    const int max_attempts = 3;
+
+    while (!file && attempts < max_attempts) {
+        file = fopen(filename, "w");
+        if (!file) {
+            perror("Failed to open statistics file");
+            fprintf(stderr, "Retrying to open file: %s\n", filename);
+            attempts++;
+            sleep(1); // Wait a bit before retrying
+        }
+    }
+
+    if (!file) {
+        fprintf(stderr, "Unable to open file %s after %d attempts\n", filename, max_attempts);
+        return;
+    }
+
     fprintf(file, "Data Sent: %lu\n", stats->data_sent);
     fprintf(file, "Data Received: %lu\n", stats->data_received);
     fprintf(file, "Data Dropped: %lu\n", stats->data_dropped);
@@ -557,8 +582,9 @@ static void store_statistics(const char *filename, Statistics *stats) {
     fprintf(file, "Ack Dropped: %lu\n", stats->ack_dropped);
     fprintf(file, "Ack Delayed: %lu\n", stats->ack_delayed);
 
-  fclose(file);
+    fclose(file);
 }
+
 
 static void send_statistics(ProxyData *proxy_data) {
     int gui_sockfd;
