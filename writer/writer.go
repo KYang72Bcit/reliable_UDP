@@ -44,6 +44,7 @@ type CustomPacket struct {
 type Header struct {
 	SeqNum uint32 `json:"seqNum"`
 	AckNum uint32  `json:"ackNum"`
+	DataLen uint32 `json:"dataLen"`
 	Flags byte     `json:"flags"`
 }
 
@@ -70,6 +71,9 @@ type WriterFSM struct {
 	timeoutDuration time.Duration
 	lastPacketMutex sync.Mutex
 	lastPacket []byte
+	wg sync.WaitGroup
+	// packetSent int
+	// packetReceived int
 }
 
 const (
@@ -129,6 +133,7 @@ func (fsm *WriterFSM) CreateSocketState() WriterState {
 }
 
 func (fsm *WriterFSM) ReadyForTransmittingState() WriterState {
+	fsm.wg.Add(3)
 	go fsm.readStdin()
 	go fsm.listenResponse()
 	go fsm.sendPacket()
@@ -142,6 +147,7 @@ func (fsm *WriterFSM) TransmittingState() WriterState {
 			case <- fsm.EOFchan:
 				return Termination
 			case <- fsm.resendChan:
+				fsm.wg.Add(1)
 				go fsm.resendPacket()
 			case <- fsm.errorChan:
 				return ErrorHandling
@@ -154,6 +160,7 @@ func (fsm *WriterFSM) TransmittingState() WriterState {
 func (fsm *WriterFSM) ErrorHandlingState() WriterState {
 		fmt.Println("Error:", fsm.err)
 		fsm.stopChan <- struct{}{}
+		fsm.wg.Wait()
 		return ReadyForTransmitting
 	}
 
@@ -168,6 +175,7 @@ func (fsm *WriterFSM) FatalErrorState() WriterState {
 
 func (fsm *WriterFSM)TerminateState() {
 	fsm.stopChan <- struct{}{}
+	fsm.wg.Wait()
 	fsm.udpcon.Close()
 	fmt.Println("Client Exiting...")
 }
@@ -198,14 +206,13 @@ func (fsm *WriterFSM) Run() {
 				fsm.TerminateState()
 			}
 		 }
-
 	}
 }
 
 /////////////////////////go routines for FSM////////////////////////////
 
 func (fsm *WriterFSM) readStdin() {
-
+		defer fsm.wg.Done()
 
 		for {
 			inputBuffer := make([]byte, bufferSize)
@@ -232,7 +239,7 @@ func (fsm *WriterFSM) readStdin() {
 
 
 func (fsm *WriterFSM) sendPacket() {
-
+	defer fsm.wg.Done()
 	for rawPacket := range fsm.inputChan {
 		packet, err := json.Marshal(rawPacket)
 		if err != nil {
@@ -273,7 +280,7 @@ func (fsm *WriterFSM) sendPacket() {
 
 
 func (fsm *WriterFSM) listenResponse() {
-
+	defer fsm.wg.Done()
 		for {
 
 			select {
@@ -292,6 +299,7 @@ func (fsm *WriterFSM) listenResponse() {
 	}
 
 	func (fsm *WriterFSM) resendPacket() {
+		defer fsm.wg.Done()
 		for  i := 0; i < fsm.maxRetries; i++ {
 			fsm.lastPacketMutex.Lock()
 			copyPacket := make([]byte, len(fsm.lastPacket))
@@ -340,6 +348,7 @@ func createPacket(ack uint32, seq uint32, flags byte, data string) CustomPacket 
 		Header: Header{
 			SeqNum: seq,
 			AckNum: ack,
+			DataLen: uint32(len(data)),
 			Flags: flags,
 		},
 		Data: data,
