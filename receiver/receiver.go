@@ -62,6 +62,8 @@ const (
 	Recover
 	HandleError
 	FatalError
+	CloseConnectionByClient //when server receive FIN from client 
+	CloseConnectionByServer // server send FIN to client
 	Termination
 )
 
@@ -185,9 +187,47 @@ func (fsm *ReceiverFSM) FatalErrorState() ReceiverState{
 	return Termination
 
 }
+//CloseConnectionByClient //when server receive FIN from client 
+//CloseConnectionByServer // server send FIN to client
+
+func (fsm *ReceiverFSM) CloseConnectionByClientState() ReceiverState {
+	
+	return Termination
+}
+
+func (fsm *ReceiverFSM) CloseConnectionByServerState() ReceiverState {
+	//send FIN to client
+	//receive ACK from client
+	//send FIN ACK to client
+	//receive ACK from client
+	
+	
+}
  
 func (fsm *ReceiverFSM) TerminationState() {
 	fsm.wg.Wait()
+	for {
+		sendPacket(fsm.ackNum, fsm.seqNum, FLAG_FIN, "", fsm.udpcon, fsm.clientAddr)
+		fsm.udpcon.SetReadDeadline(time.Now().Add(2000 * time.Millisecond))
+		buffer := make([]byte, bufferSize)
+		n, _, err := fsm.udpcon.ReadFromUDP(buffer)
+				if err != nil {
+					if netErr, ok := err.(net.Error); ok && netErr.Timeout(){
+						continue
+					}
+					fsm.errorChan <- err
+					fmt.Println("listenResponse get error")
+					return
+				}
+				if n > 0 {
+				rawPacket := buffer[:n]
+				_, header, _ := parsePacket(rawPacket)
+				if isFINPacket(header) {
+					break
+				}
+				}		
+		
+	}
 	fsm.udpcon.Close()
 	fmt.Println("UDP server exiting...")
 	
@@ -260,13 +300,16 @@ func (fsm *ReceiverFSM) confirmPacket() {
 			case rawPacket := <- fsm.responseChan:
 				packet, header, err := parsePacket(rawPacket)
 				if err != nil {
-					fmt.Println("error in confirmPacket")
 					fsm.errorChan <- err
+				}
+				if isSYNPacket(header){
+					fsm.ackNum = header.SeqNum
 				}
 				if isValidPacket(header, fsm.ackNum, fsm.seqNum) {
 					fsm.outputChan <- *packet
 					fsm.ackNum += header.DataLen
 				}
+			
 				if fsm.clientAddr != nil {
 					sendPacket(fsm.ackNum, fsm.seqNum, FLAG_ACK, "", fsm.udpcon, fsm.clientAddr)
 				} else {
@@ -327,10 +370,17 @@ func isValidPacket(header *Header , ackNum uint32, seqNum uint32) bool {
 	return header.SeqNum == ackNum
 
 }
+func isSYNPacket(header *Header) bool {
+	return header.Flags == FLAG_SYN
+}
+
+func isFINPacket(header *Header) bool {
+	return header.Flags == FLAG_FIN
+}
 
 func parsePacket(response []byte) (*CustomPacket, *Header, error) {
 	var packet CustomPacket
-	fmt.Println(string(response))
+	fmt.Println("Receive Packet" + string(response))
 	err := json.Unmarshal(response, &packet)
 	if err != nil {
 		return &CustomPacket{}, &Header{}, err
@@ -360,7 +410,7 @@ func sendPacket(ack uint32, seq uint32, flags byte, data string, udpcon *net.UDP
 		if err != nil {
 			fmt.Println(err)
 		}
-
+	fmt.Println("Send Packet" + string(packet))
 	return len(data), err
 
 }
