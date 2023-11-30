@@ -18,6 +18,7 @@
 #include <sys/select.h>  
 #include <stdbool.h>
 #include <signal.h>
+#include <net/if.h>
 
 // Define constants
 #define UNKNOWN_OPTION_MESSAGE_LEN 24
@@ -41,13 +42,17 @@ typedef enum {
 } ProxyState;
 
 typedef struct {
+    unsigned long data_sent, data_received, data_dropped, data_delayed, ack_sent, ack_received, ack_dropped, ack_delayed;        
+    pthread_mutex_t stats_mutex;  
+} Statistics;
+
+typedef struct {
     ProxyState currentState;
     int argc;
     char **argv, *receiver_ip, receiver_port, writer_port;
     in_port_t port;                    
     struct sockaddr_storage addr;      
     pthread_t t_idle, t_data, t_ack;
-    ProxyData proxy_data;  
 } FSM;
 
 typedef struct {
@@ -57,11 +62,6 @@ typedef struct {
     Statistics *stats;
     FSM *fsm;
 } ProxyData;
-
-typedef struct {
-    unsigned long data_sent, data_received, data_dropped, data_delayed, ack_sent, ack_received, ack_dropped, ack_delayed;        
-    pthread_mutex_t stats_mutex;  
-} Statistics;
 
 static void parse_arguments(FSM *fsm, ProxyData *proxy_data);
 static void handle_arguments(const char *binary_name, FSM *fsm);
@@ -74,22 +74,23 @@ static void transition(FSM *fsm, ProxyData *proxy_data);
 static void *idle_handler(void *arg);
 static void *ack_handler(void *arg);
 static void *data_handler(void *arg);
-static void receive_data(ProxyData *proxy_data);
+static void receive_data(FSM *fsm, ProxyData *proxy_data);
 static void receive_ack(ProxyData *proxy_data);
 static void drop_or_delay(ProxyData *proxy_data);
-static void forward_data(ProxyData *proxy_data, const char *data, size_t data_len);
+static void forward_data(FSM *fsm, ProxyData *proxy_data, const char *data, size_t data_len);
 static void forward_ack(ProxyData *proxy_data, const char *data, size_t data_len);
 static void store_statistics(const char *filename, Statistics *stats);
 static void send_statistics(ProxyData *proxy_data);
 static void cleanup(ProxyData *proxy_data);
 static void socket_close(int sockfd);
+static void handle_signal(int sig);
 
 int main(int argc, char *argv[]) {
     FSM fsm;
     fsm.currentState = INITIALIZE;
     fsm.argc = argc;              
     fsm.argv = argv;              
-    Statistics stats = {0, 0, PTHREAD_MUTEX_INITIALIZER};
+    Statistics stats = {0, 0, 0, 0, 0, 0, 0, 0, PTHREAD_MUTEX_INITIALIZER};
     ProxyData proxy_data = {0};    
     proxy_data.stats = &stats;    
 
@@ -152,7 +153,7 @@ static void parse_arguments(FSM *fsm, ProxyData *proxy_data) {
         usage(fsm->argv[0], EXIT_FAILURE, "Incorrect number of arguments.");
     }
 
-    *fsm->receiver_ip = fsm->argv[optind];
+    fsm->receiver_ip = fsm->argv[optind];
     fsm->receiver_port = parse_in_port_t(fsm->argv[0], fsm->argv[optind + 1]);
     fsm->writer_port = parse_in_port_t(fsm->argv[0], fsm->argv[optind + 2]);
     proxy_data->drop_data_chance = atof(fsm->argv[optind + 3]);
@@ -186,7 +187,7 @@ in_port_t parse_in_port_t(const char *binary_name, const char *str) {
   char *endptr;
   uintmax_t parsed_value;
   errno = 0;
-  parsed_value = strtoumax(str, &endptr, BASE_TEN);
+  parsed_value = strtoull(str, &endptr, BASE_TEN);
   if (errno != 0) {
     perror("Error parsing in_port_t");
     exit(EXIT_FAILURE);
@@ -301,7 +302,7 @@ static void transition(FSM *fsm, ProxyData *proxy_data) {
   case INITIALIZE:
     // Parse and handle arguments to set receiver IP and ports
     parse_arguments(fsm, proxy_data);
-    handle_arguments(fsm, fsm->proxy_data);
+    handle_arguments(fsm->argv[0], fsm);
     fsm->currentState = SOCKET_CREATE;
     break;
     case SOCKET_CREATE:
@@ -318,15 +319,15 @@ static void transition(FSM *fsm, ProxyData *proxy_data) {
       break;
   case THREAD_CREATE:
     // Thread creation for idle, resend, and ack handlers
-    if (pthread_create(&fsm->t_idle, NULL, idle_handler, &fsm->proxy_data) != 0) {
+    if (pthread_create(&fsm->t_idle, NULL, idle_handler, &proxy_data) != 0) {
         perror("Failed to create idle handler thread");
         exit(EXIT_FAILURE);
     }
-    if (pthread_create(&fsm->t_data, NULL, data_handler, &fsm->proxy_data) != 0) {
+    if (pthread_create(&fsm->t_data, NULL, data_handler, &proxy_data) != 0) {
         perror("Failed to create data handler thread");
         exit(EXIT_FAILURE);
     }
-    if (pthread_create(&fsm->t_ack, NULL, ack_handler, &fsm->proxy_data) != 0) {
+    if (pthread_create(&fsm->t_ack, NULL, ack_handler, &proxy_data) != 0) {
         perror("Failed to create ack handler thread");
         exit(EXIT_FAILURE);
     }
@@ -340,7 +341,7 @@ static void transition(FSM *fsm, ProxyData *proxy_data) {
     fsm->currentState = IDLE;
     break;
   case IDLE:
-    idle_handler(&(fsm->proxy_data));
+    idle_handler(&(proxy_data)); 
     break;
   case CLEAN_UP:
     cleanup(proxy_data);
@@ -382,11 +383,11 @@ static void *idle_handler(void *arg) {
         }
 
         if (FD_ISSET(proxy_data->writer_sockfd, &readfds)) {
-            receive_data(proxy_data);
+            receive_data(proxy_data->fsm, proxy_data);
         }
 
         if (FD_ISSET(proxy_data->receiver_sockfd, &readfds)) {
-            receive_ack(&(proxy_data->receiver_addr));
+            receive_ack(proxy_data); // Pass proxy_data directly, not its address
         }
 
         // Check if signal received
@@ -437,19 +438,20 @@ static void *data_handler(void *arg) {
             sleep(5);
         }
 
-        receive_data(proxy_data);
+        receive_data(proxy_data->fsm, proxy_data);
     }
 
     return NULL;
 }
 
 // Function to indefinitely listen for data sent from the writer
-static void receive_data(ProxyData *proxy_data) {
+static void receive_data(FSM *fsm, ProxyData *proxy_data) {
     char buffer[BUFFER_SIZE];
     socklen_t addr_len = sizeof(proxy_data->writer_addr);
 
     while (1) {
-        ssize_t numBytes = recvfrom(proxy_data->writer_sockfd, buffer, BUFFER_SIZE, 0, &proxy_data->writer_addr, &addr_len);
+        ssize_t numBytes = recvfrom(proxy_data->writer_sockfd, buffer, BUFFER_SIZE, 0, 
+                            (struct sockaddr *)&proxy_data->writer_addr, &addr_len);
         if (numBytes < 0) {
             perror("recvfrom failed");
             continue;
@@ -459,7 +461,7 @@ static void receive_data(ProxyData *proxy_data) {
             pthread_mutex_unlock(&proxy_data->stats->stats_mutex);
         }
 
-        forward_data(proxy_data, buffer, numBytes);
+        forward_data(fsm, proxy_data, buffer, numBytes);
     }
 }
 
@@ -471,7 +473,8 @@ static void receive_ack(ProxyData *proxy_data) {
     int drop_ack_decision, delay_ack_decision;
 
     while (1) {
-        ssize_t numBytes = recvfrom(proxy_data->receiver_sockfd, buffer, BUFFER_SIZE, 0, &proxy_data->writer_addr, &addr_len);
+        ssize_t numBytes = recvfrom(proxy_data->receiver_sockfd, buffer, BUFFER_SIZE, 0, 
+                            (struct sockaddr *)&proxy_data->writer_addr, &addr_len);
         if (numBytes < 0) {
             perror("recvfrom failed");
             continue;
@@ -517,21 +520,21 @@ static void drop_or_delay(ProxyData *proxy_data) {
 }
 
 // Forward data to the receiver
-static void forward_data(ProxyData *proxy_data, const char *data, size_t data_len) {
+static void forward_data(FSM *fsm, ProxyData *proxy_data, const char *data, size_t data_len) {
     struct sockaddr_storage receiver_addr;
-    convert_address(proxy_data->fsm->receiver_ip, &receiver_addr);
+    convert_address(fsm->receiver_ip, &receiver_addr);
 
     if (receiver_addr.ss_family == AF_INET) {
-        ((struct sockaddr_in *)&receiver_addr)->sin_port = htons(proxy_data->fsm->receiver_port);
+        ((struct sockaddr_in *)&receiver_addr)->sin_port = htons(fsm->receiver_port);
     } else if (receiver_addr.ss_family == AF_INET6) {
-        ((struct sockaddr_in6 *)&receiver_addr)->sin6_port = htons(proxy_data->fsm->receiver_port);
+        ((struct sockaddr_in6 *)&receiver_addr)->sin6_port = htons(fsm->receiver_port);
     }
 
     ssize_t sent_bytes = sendto(proxy_data->receiver_sockfd, data, data_len, 0, (struct sockaddr *)&receiver_addr, sizeof(receiver_addr));
     if (sent_bytes < 0) {
         perror("Failed to send data");
         fprintf(stderr, "Error sending data: %s\n", strerror(errno));
-        receive_data(proxy_data);
+        receive_data(fsm, proxy_data);
     } else {
         pthread_mutex_lock(&proxy_data->stats->stats_mutex);
         proxy_data->stats->data_sent++;
@@ -620,7 +623,7 @@ static void send_statistics(ProxyData *proxy_data) {
 
     // Convert statistics to a string format
     char stats_buffer[1024];
-    snprintf(stats_buffer, sizeof(stats_buffer), "%lu,%lu", proxy_data->stats->packets_sent, proxy_data->stats->packets_received);
+    snprintf(stats_buffer, sizeof(stats_buffer), "%lu,%lu", proxy_data->stats->data_sent, proxy_data->stats->data_received);
 
     // Send the statistics
     if (send(gui_sockfd, stats_buffer, strlen(stats_buffer), 0) < 0) {
