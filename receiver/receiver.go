@@ -187,22 +187,16 @@ func (fsm *ReceiverFSM) FatalErrorState() ReceiverState{
 	return Termination
 
 }
-//CloseConnectionByClient //when server receive FIN from client 
-//CloseConnectionByServer // server send FIN to client
 
-func (fsm *ReceiverFSM) CloseConnectionByClientState() ReceiverState {
-	
-	return Termination
-}
 
-func (fsm *ReceiverFSM) CloseConnectionByServerState() ReceiverState {
-	//send FIN to client
-	//receive ACK from client
-	//send FIN ACK to client
-	//receive ACK from client
+// func (fsm *ReceiverFSM) CloseConnectionByServerState() ReceiverState {
+// 	//send FIN to client
+// 	//receive ACK from client
+// 	//send FIN ACK to client
+// 	//receive ACK from client
 	
 	
-}
+// }
  
 func (fsm *ReceiverFSM) TerminationState() {
 	fsm.wg.Wait()
