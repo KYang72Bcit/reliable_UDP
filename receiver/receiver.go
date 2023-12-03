@@ -30,7 +30,7 @@ const (
 
 const (
 	args = 3
-	maxRetries = 5
+	maxRetries = 3
 	bufferSize = 512
 	packetBufferSize = 50
 )
@@ -84,6 +84,7 @@ type ReceiverFSM struct {
 	wg sync.WaitGroup
 	shouldRun int32
 	clientAddr *net.UDPAddr
+	maxRetries int
 
 }
 
@@ -101,6 +102,7 @@ func NewReceiverFSM() *ReceiverFSM {
 		resendChan: make(chan struct{}),
 		outputChan: make(chan CustomPacket, packetBufferSize),
 		quitChan: make(chan os.Signal, 1), //channel for handling ctrl+c
+		maxRetries: maxRetries,
 	}
 }
 
@@ -170,8 +172,6 @@ func (fsm *ReceiverFSM) ReceivingState() ReceiverState {
 
 		}
 	}
-
-
 }
 
 func (fsm *ReceiverFSM) HandleErrorState() ReceiverState{
@@ -188,19 +188,10 @@ func (fsm *ReceiverFSM) FatalErrorState() ReceiverState{
 
 }
 
-
-// func (fsm *ReceiverFSM) CloseConnectionByServerState() ReceiverState {
-// 	//send FIN to client
-// 	//receive ACK from client
-// 	//send FIN ACK to client
-// 	//receive ACK from client
-	
-	
-// }
  
 func (fsm *ReceiverFSM) TerminationState() {
 	fsm.wg.Wait()
-	for {
+	for i := 0; i < maxRetries; i++{
 		sendPacket(fsm.ackNum, fsm.seqNum, FLAG_FIN, "", fsm.udpcon, fsm.clientAddr)
 		fsm.udpcon.SetReadDeadline(time.Now().Add(2000 * time.Millisecond))
 		buffer := make([]byte, bufferSize)
@@ -216,12 +207,13 @@ func (fsm *ReceiverFSM) TerminationState() {
 				if n > 0 {
 				rawPacket := buffer[:n]
 				_, header, _ := parsePacket(rawPacket)
-				if isFINPacket(header) {
+				if isFINACKPacket(header) {
 					break
 				}
-				}		
-		
+				}					
 	}
+	
+	
 	fsm.udpcon.Close()
 	fmt.Println("UDP server exiting...")
 	
@@ -370,6 +362,9 @@ func isSYNPacket(header *Header) bool {
 
 func isFINPacket(header *Header) bool {
 	return header.Flags == FLAG_FIN
+}
+func isFINACKPacket(header *Header) bool {
+	return header.Flags == FLAG_ACK|FLAG_FIN
 }
 
 func parsePacket(response []byte) (*CustomPacket, *Header, error) {

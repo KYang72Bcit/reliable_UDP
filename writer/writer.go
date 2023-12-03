@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"strings"
 
 	// "strings"
 	"sync"
@@ -63,18 +64,20 @@ type WriterFSM struct {
 	responseChan chan []byte //channel for response handling
 	inputChan chan CustomPacket //channel for input handling
 	errorChan chan error //channel for error handling between go routines
-	resendChan chan struct{} //channel for resend handling
 	stopChan chan struct{} //channel for notifying go routines to stop
 	serverCloseChan chan struct{} //channel for server close handling
+	transmitChan chan struct{} //channel for notifying transmission
+	reTransmitChan chan struct{} //channel for notifying retransmission
 	ack uint32
 	seq uint32
 	data string
 	timeoutDuration time.Duration
 	lastPacketMutex sync.Mutex
+	lastResponseMutex sync.Mutex
 	lastPacket []byte
 	wg sync.WaitGroup
-	// packetSent int
-	// packetReceived int
+	isStdInStarted bool
+	isLastPacketACKReceived bool
 }
 
 const (
@@ -82,6 +85,7 @@ const (
 	CreateSocket
 	SyncronizeServer
 	Transmitting
+	ReTransmitting
 	Recover
 	ErrorHandling
 	FatalError
@@ -99,15 +103,18 @@ func NewWriterFSM() *WriterFSM {
 		responseChan: make(chan []byte),
 		inputChan: make(chan CustomPacket, packetBufferSize),
 		errorChan: make(chan error),
-		resendChan: make(chan struct{}),
 		EOFchan: make(chan struct{}),
 		stopChan: make(chan struct{}),
+		transmitChan: make(chan struct{}),
+		reTransmitChan: make(chan struct{}),
 		ack: 0,
 		seq: 0,
 		data: "",
 		serverCloseChan: make(chan struct{}),
 		lastPacket: make([]byte, 0),
 		timeoutDuration: 2 * time.Second,
+		isStdInStarted: false,
+
 	}
 }
 
@@ -140,7 +147,7 @@ func (fsm *WriterFSM) CreateSocketState() WriterState {
 func (fsm *WriterFSM) SyncronizeServerState() WriterState {
 	fsm.wg.Add(2)
 
-	go fsm.listenResponse(500 * time.Millisecond)
+	go fsm.listenResponse(1000 * time.Millisecond)
 	go fsm.sendPacket()
 	for {
 		packet := createPacket(fsm.ack, fsm.seq, FLAG_SYN, "")
@@ -148,8 +155,13 @@ func (fsm *WriterFSM) SyncronizeServerState() WriterState {
 		select {
 			case fsm.err = <- fsm.errorChan:
 				return FatalError
-			case <- fsm.responseChan: //need to check if the response is valid? 
-				return Transmitting
+			case responsePacket := <- fsm.responseChan:
+				if isValidPacket(responsePacket, FLAG_ACK, fsm.seq){
+					return Transmitting
+				} else {
+					continue
+				}
+
 			case <- time.After(fsm.timeoutDuration):
 				continue
 		}
@@ -160,7 +172,12 @@ func (fsm *WriterFSM) SyncronizeServerState() WriterState {
 /////////////////////////////////////////////Transmitting State////////////////////////////////////////
 
 func (fsm *WriterFSM) TransmittingState() WriterState {
-	go fsm.readStdin()
+	fmt.Println("Transmitting")
+	if !fsm.isStdInStarted {
+		go fsm.readStdin()
+		fsm.isStdInStarted = true
+	}
+
 	for {
 		select {
 			case <- fsm.EOFchan:
@@ -169,14 +186,42 @@ func (fsm *WriterFSM) TransmittingState() WriterState {
 				return CloseConnectionByServer
 			case fsm.err = <- fsm.errorChan:
 				return ErrorHandling
+			case <-fsm.reTransmitChan:
+				return ReTransmitting
+			case <-fsm.transmitChan:
+				continue
 
 		}
 	}
 }
 
+func (fsm *WriterFSM) ReTransmittingState() WriterState {
+	fmt.Println("ReTransmitting")
+
+	for i := 0; i < maxRetries; i++ {
+		fsm.resendPacket()
+		select {
+			case <- fsm.EOFchan:
+				return Termination
+			case <-fsm.serverCloseChan:
+				return CloseConnectionByServer
+			case fsm.err = <- fsm.errorChan:
+				return ErrorHandling
+			case <-fsm.transmitChan:
+				return Transmitting
+			case <-fsm.reTransmitChan:
+				continue
+
+		}
+	}
+	return FatalError
+
+
+}
+
 func (fsm *WriterFSM) ErrorHandlingState() WriterState {
 	fmt.Println("Error:", fsm.err)
-	close(fsm.stopChan) //notify all goroutines to stop 
+	close(fsm.stopChan) //notify all goroutines to stop
 	fmt.Println("Error before wait ")
 	fsm.wg.Wait()
 	fmt.Println("Something goes wrong, start over again ")
@@ -201,15 +246,15 @@ func (fsm *WriterFSM) FatalErrorState() WriterState {
 
 
 func (fsm *WriterFSM) CloseConnectionByServerState() WriterState {
-	//on receive FIN from server, 
 	fmt.Println("Closing connection by server")
 	close(fsm.stopChan)
 	fsm.wg.Wait()
 	fmt.Println("all goroutines closed")
-	go fsm.listenResponse(500*time.Millisecond)
-	
-	for {
-		packet, _ := json.Marshal(createPacket(fsm.ack, fsm.seq, FLAG_ACK, ""))
+	fsm.wg.Add(1)
+	go fsm.listenResponse(5000*time.Millisecond)
+
+	for  i := 0; i < maxRetries; i++ {
+		packet, _ := json.Marshal(createPacket(fsm.ack, fsm.seq, FLAG_FIN|FLAG_ACK, ""))
 		_, err := fsm.udpcon.Write(packet)
 		if err != nil {
 
@@ -218,17 +263,39 @@ func (fsm *WriterFSM) CloseConnectionByServerState() WriterState {
 		select {
 			case response := <- fsm.responseChan:
 				if isValidPacket(response, FLAG_FIN|FLAG_ACK, fsm.seq) {
-					return Exit
+					break
+
 				}
 			case <- time.After(fsm.timeoutDuration):
 				continue
 
 		}
 	}
+
+	for  i := 0; i < maxRetries; i++ {
+		packet, _ := json.Marshal(createPacket(fsm.ack, fsm.seq, FLAG_FIN, ""))
+		_, err := fsm.udpcon.Write(packet)
+		if err != nil {
+
+			return Exit
+		}
+		select {
+			case response := <- fsm.responseChan:
+				if isValidPacket(response, FLAG_FIN, fsm.seq) {
+					return Exit
+
+				}
+			case <- time.After(fsm.timeoutDuration):
+				continue
+		}
+
+	}
+	return Exit
 }
 
 func (fsm *WriterFSM)TerminateState() WriterState {
 	close(fsm.stopChan)
+	fmt.Println("closing go routines")
 	fsm.wg.Wait()
 	fmt.Println("all goroutines closed")
 	fsm.udpcon.Close()
@@ -257,6 +324,8 @@ func (fsm *WriterFSM) Run() {
 				fsm.currentState = fsm.SyncronizeServerState()
 			case Transmitting:
 				fsm.currentState = fsm.TransmittingState()
+			case ReTransmitting:
+				fsm.currentState = fsm.ReTransmittingState()
 			case ErrorHandling:
 				fsm.currentState = fsm.ErrorHandlingState()
 			case CloseConnectionByServer:
@@ -266,7 +335,7 @@ func (fsm *WriterFSM) Run() {
 			case FatalError:
 				fsm.currentState = fsm.FatalErrorState()
 			case Termination:
-				fsm.currentState = fsm.TerminateState() 
+				fsm.currentState = fsm.TerminateState()
 			case Exit:
 				fsm.ExitState()
 				return
@@ -292,6 +361,7 @@ func (fsm *WriterFSM) readStdin() {
 		}
 		if n > 0 {
 			data := string(inputBuffer[:n])
+			data = strings.Trim(data, "\n")
 			packet := createPacket(fsm.ack, fsm.seq, FLAG_DATA, string(data))
 				fsm.inputChan <- packet
 				fsm.seq += uint32(len(data))
@@ -300,41 +370,52 @@ func (fsm *WriterFSM) readStdin() {
 	}
 }
 
+
 func (fsm *WriterFSM) listenResponse(timout time.Duration) {
+	defer fmt.Println("closing listen response")
 	defer fsm.wg.Done()
 	for {
 		select {
 		case <-fsm.stopChan:
 			return
 		default:
-			fsm.udpcon.SetReadDeadline(time.Now().Add(timout))
+			fsm.udpcon.SetReadDeadline(time.Now().Add(500*time.Millisecond))
 			buffer := make([]byte, bufferSize)
 			n, err := fsm.udpcon.Read(buffer)
 			if err != nil {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-					fsm.resendPacket()
-						
+
+					continue
+
 				} else {
 					fsm.errorChan <- err
 						return
-				}	
+				}
 			}
+			if n > 0 {
+				if fsm.currentState == Transmitting || fsm.currentState == ReTransmitting {
+				if isValidPacket(buffer[:n], FLAG_ACK, fsm.seq) {
+					fsm.lastResponseMutex.Lock()
+					fsm.isLastPacketACKReceived = true
+					fsm.lastResponseMutex.Unlock()
+					fsm.transmitChan <- struct{}{}
+				}
+				if isFINPacket(buffer[:n]) {
+					fsm.serverCloseChan <- struct{}{}
+				}
 
-			responsePacket := buffer[:n]
-			if isValidPacket(responsePacket, FLAG_ACK, fsm.seq) {
-				fsm.responseChan <- responsePacket
-			} else if isFINPacket(responsePacket) {
-				fsm.serverCloseChan <- struct{}{}
-				return
 			} else {
-				fsm.resendPacket()
+				fsm.responseChan <- buffer[:n]
 			}
+		}
+
 		}
 	}
 }
 
 
 func (fsm *WriterFSM) sendPacket() {
+	defer fmt.Println("closing send packet")
 	defer fsm.wg.Done()
 	for {
 	select {
@@ -349,33 +430,41 @@ func (fsm *WriterFSM) sendPacket() {
 				fsm.errorChan <- err
 				return
 			}
+
+			fsm.lastResponseMutex.Lock()
+			fsm.isLastPacketACKReceived = false
+			fsm.lastResponseMutex.Unlock()
+
 			_, err = fsm.udpcon.Write(packet)
+			fmt.Println("packet sent: ", string(packet))
 			if err != nil {
 				fsm.errorChan <- err
 				return
 			}
-			} 
- 
-			// go func(seq uint32) {
-			// 	select {
-			// 	case response := <-fsm.responseChan:
-			// 		fmt.Println( "response: ", string(response))
-			// 		if isFINPacket(response) {
-			// 			fsm.serverCloseChan <- struct{}{}
-			// 			return
-			// 		}
-			// 		if !isValidPacket(response, FLAG_ACK, seq) {
-			// 			fsm.resendChan <- struct{}{}
-			// 		}
-			// 	case <-time.After(fsm.timeoutDuration):
-			// 		fsm.resendChan <- struct{}{}
-			// 	}
-			// }(fsm.seq)
+			if fsm.currentState == Transmitting || fsm.currentState == ReTransmitting {
+			fsm.lastPacketMutex.Lock()
+			fsm.lastPacket = packet
+			fsm.lastPacketMutex.Unlock()
+
+			go func() {
+				time.Sleep(fsm.timeoutDuration)
+
+				fsm.lastPacketMutex.Lock()
+				if !fsm.isLastPacketACKReceived {
+					fsm.reTransmitChan <- struct{}{}
+				}
+				fsm.lastPacketMutex.Unlock()
+			}()
+		}
+	}
+
+
 	}
 }
 
 
 func (fsm *WriterFSM) resendPacket() {
+	// defer fsm.wg.Done()
 	fsm.lastPacketMutex.Lock()
 					packet := make([]byte, len(fsm.lastPacket))
 					copy(packet, fsm.lastPacket)
@@ -388,40 +477,6 @@ func (fsm *WriterFSM) resendPacket() {
 }
 
 
-// func (fsm *WriterFSM) resendPacket() {
-// 	defer fsm.wg.Done()
-// 	select {
-// 		case <- fsm.stopChan:
-// 			return
-// 		case <- fsm.resendChan:
-// 			for i := 0; i < fsm.maxRetries; i++ {
-
-// 				fsm.lastPacketMutex.Lock()
-// 				packet := make([]byte, len(fsm.lastPacket))
-// 				copy(packet, fsm.lastPacket)
-// 				fsm.lastPacketMutex.Unlock()
-// 				_, err := fsm.udpcon.Write(packet)
-// 				if err != nil {
-// 					fsm.errorChan <- err
-// 					return
-// 				}
-// 				select {
-// 				case response := <-fsm.responseChan:
-// 					if isFINPacket(response) {
-// 						fsm.serverCloseChan <- struct{}{}
-// 						return 
-// 					}
-// 					if isValidPacket(response, FLAG_ACK, fsm.seq) {
-// 						return
-// 					}
-// 				case <-time.After(fsm.timeoutDuration):
-// 					continue
-// 			}
-// 		}
-// 		fsm.errorChan <- errors.New("max retries reached")
-// 	}
-
-// }
 
 
 
@@ -466,6 +521,7 @@ func isValidPacket(response []byte, flags byte, seq uint32) bool {
 	fmt.Println("actual ackNum: ", fmt.Sprint(header.AckNum))
 	return header.Flags == flags && header.AckNum == seq
 }
+
 func isFINPacket(response []byte) bool {
 	header,  err := parsePacket(response)
 	if err != nil {
