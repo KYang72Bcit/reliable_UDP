@@ -14,8 +14,8 @@
 #include <time.h>
 #include <errno.h>
 #include <getopt.h>
-#include <fcntl.h>      
-#include <sys/select.h>  
+#include <fcntl.h>
+#include <sys/select.h>
 #include <stdbool.h>
 #include <signal.h>
 #include <net/if.h>
@@ -24,162 +24,189 @@
 #define UNKNOWN_OPTION_MESSAGE_LEN 24
 #define BASE_TEN 10
 #define BUFFER_SIZE 1024
-#define GUI_IP "127.0.0.1" // Replace with the IP of the machine running the Python GUI
-#define GUI_PORT 65432     // Replace with the port on which the Python GUI is listening
 
-volatile sig_atomic_t signal_received = 0;
-
-// Enum for FSM states
 typedef enum {
-  INITIALIZE,
-  SOCKET_CREATE,
-  BINDING,
-  THREAD_CREATE,
-  THREAD_JOIN,
-  IDLE,
-  CLEAN_UP,
-  HANDLE_ERROR
+    INITIALIZE,
+    PARSE_ARUGMENTS,
+    SOCKET_CREATE,
+    WAITING_FOR_DATA,
+    FORWARDING_DATA,
+    WAITING_FOR_ACK,
+    FORWARDING_ACK,
+    HANDLE_ERROR,
+    TERMINATE
 } ProxyState;
 
 typedef struct {
-    unsigned long data_sent, data_received, data_dropped, data_delayed, ack_sent, ack_received, ack_dropped, ack_delayed;        
-    pthread_mutex_t stats_mutex;  
-} Statistics;
-
-typedef struct {
-    ProxyState currentState;
-    int argc;
-    char **argv, *receiver_ip, receiver_port, writer_port;
-    in_port_t port;                    
-    struct sockaddr_storage addr;      
-    pthread_t t_idle, t_data, t_ack;
+    char *receiver_ip, **argv;
+    in_port_t writer_port, receiver_port;
+    float drop_data_chance, drop_ack_chance, delay_data_chance, delay_ack_chance;
+    int argc, writer_sockfd, receiver_sockfd;
+    struct sockaddr_storage writer_addr, receiver_addr;
+    char data_buffer[BUFFER_SIZE], ack_buffer[BUFFER_SIZE];
+    ssize_t numBytes;
+    socklen_t writer_addr_len, receiver_addr_len;
+    bool data_received, ack_received;
 } FSM;
 
-typedef struct {
-    struct sockaddr_storage receiver_addr, writer_addr;
-    float drop_data_chance, delay_data_chance, drop_ack_chance, delay_ack_chance;
-    int writer_sockfd, receiver_sockfd, delay_ack_decision, delay_data_decision, drop_ack_decision, drop_data_decision;
-    Statistics *stats;
-    FSM *fsm;
-} ProxyData;
-
-static void parse_arguments(FSM *fsm, ProxyData *proxy_data);
-static void handle_arguments(const char *binary_name, FSM *fsm);
+static void parse_arguments(int argc, char *argv[], char **receiver_ip, in_port_t *writer_port, in_port_t *receiver_port, float *drop_data_chance, float *drop_ack_chance, float *delay_data_chance, float *delay_ack_chance);
+static void handle_arguments(char *receiver_ip, in_port_t receiver_port, in_port_t writer_port);
 in_port_t parse_in_port_t(const char *binary_name, const char *str);
-_Noreturn static void usage(const char *program_name, int exit_code, const char *message);
 static void convert_address(const char *address, struct sockaddr_storage *addr);
 static int socket_create(int domain, int type, int protocol);
-static void socket_bind(int sockfd, struct sockaddr_storage *addr, in_port_t port);
-static void transition(FSM *fsm, ProxyData *proxy_data);
-static void *idle_handler(void *arg);
-static void *ack_handler(void *arg);
-static void *data_handler(void *arg);
-static void receive_data(FSM *fsm, ProxyData *proxy_data);
-static void receive_ack(ProxyData *proxy_data);
-static void drop_or_delay(ProxyData *proxy_data);
-static void forward_data(FSM *fsm, ProxyData *proxy_data, const char *data, size_t data_len);
-static void forward_ack(ProxyData *proxy_data, const char *data, size_t data_len);
-static void store_statistics(const char *filename, Statistics *stats);
-static void send_statistics(ProxyData *proxy_data);
-static void cleanup(ProxyData *proxy_data);
+static int socket_bind(int sockfd, in_port_t port);
+static bool receive_data(int writer_sockfd, struct sockaddr_storage writer_addr, socklen_t writer_addr_len, char *data_buffer, size_t *numBytes, FSM *fsm);
+static bool receive_ack(int writer_sockfd, int receiver_sockfd, struct sockaddr_storage receiver_addr, socklen_t receiver_addr_len, FSM *fsm);
+static bool drop_or_delay_data(float drop_chance, float delay_chance, char *data, size_t data_len);
+static bool drop_or_delay_ack(float drop_chance, float delay_chance, char *ack, size_t ack_len);
+static void forward_data(int receiver_sockfd, struct sockaddr_storage receiver_addr, socklen_t receiver_addr_len, const char *data, size_t data_len);
+static void forward_ack(int writer_sockfd, struct sockaddr_storage writer_addr, socklen_t writer_addr_len, const char *ack, size_t ack_len, FSM *fsm);
+static void cleanup(int writer_sockfd, int receiver_sockfd);
 static void socket_close(int sockfd);
-static void handle_signal(int sig);
 
 int main(int argc, char *argv[]) {
-    FSM fsm;
-    fsm.currentState = INITIALIZE;
-    fsm.argc = argc;              
-    fsm.argv = argv;              
-    Statistics stats = {0, 0, 0, 0, 0, 0, 0, 0, PTHREAD_MUTEX_INITIALIZER};
-    ProxyData proxy_data = {0};    
-    proxy_data.stats = &stats;    
+    FSM fsm_instance;
+    FSM *fsm = &fsm_instance;
+    memset(&fsm_instance, 0, sizeof(FSM));
+    fsm->argc = argc;
+    fsm->argv = argv;
+    ProxyState currentState = INITIALIZE;
+    fsm->writer_addr_len = sizeof(fsm->writer_addr);
+    fsm->receiver_addr_len = sizeof(fsm->receiver_addr);
+    srand(time(NULL));
+    struct pollfd fds[2];
+    int poll_result;
+    int timeout =  3000; // Timeout in milliseconds
 
-    // Check for minimum required arguments
-    if (argc < 8) {
-        usage(argv[0], EXIT_FAILURE, "Usage: <Receiver IP> <Receiver to send to> <Writer Port> <Drop Data %> <Drop Ack %> <Delay Data %> <Delay Ack %>");
-        exit(EXIT_FAILURE);
-    }
+    while (currentState != TERMINATE) {
+        if (currentState == INITIALIZE) {
+            printf("Transitioned to INITIALIZE State.\n");
+            if (argc != 8) {
+                fprintf(stderr, "Expected usage: %s <Receiver IP> <Receiver Port> <Writer Port> <Drop Data %> <Drop Ack %> <Delay Data %> <Delay Ack %>\n", argv[0]);
+                return EXIT_FAILURE;
+            }
 
-    transition(&fsm, &proxy_data);
+            parse_arguments(fsm->argc, fsm->argv, &fsm->receiver_ip, &fsm->writer_port, &fsm->receiver_port, &fsm->drop_data_chance, &fsm->drop_ack_chance, &fsm->delay_data_chance, &fsm->delay_ack_chance);
+            handle_arguments(fsm->receiver_ip, fsm->receiver_port, fsm->writer_port);
+            convert_address(fsm->receiver_ip, &fsm->receiver_addr);
 
-    // Register signal handler, Handle Ctrl+C
-    signal(SIGINT, handle_signal);  
-    // Handle termination signal
-    signal(SIGTERM, handle_signal);
+            // Print out the parsed arguments
+            printf("Receiver IP: %s\n", fsm->receiver_ip);
+            printf("Receiver Port: %hu\n", fsm->receiver_port);
+            printf("Writer Port: %hu\n", fsm->writer_port);
+            printf("Drop Data Chance: %.2f%%\n", fsm->drop_data_chance);
+            printf("Drop Ack Chance: %.2f%%\n", fsm->drop_ack_chance);
+            printf("Delay Data Chance: %.2f%%\n", fsm->delay_data_chance);
+            printf("Delay Ack Chance: %.2f%%\n\n", fsm->delay_ack_chance);
+            
+            fsm->writer_sockfd = socket_create(AF_INET, SOCK_DGRAM, 0);
+            fsm->receiver_sockfd = socket_create(AF_INET, SOCK_DGRAM, 0);
+            socket_bind(fsm->writer_sockfd, fsm->writer_port);
+            ((struct sockaddr_in*)&fsm->receiver_addr)->sin_port = htons(fsm->receiver_port);
 
-    // Generate file name with timestamp for statistics
-    char filename[256];
-    time_t now = time(NULL);
-    struct tm *tm_info = localtime(&now);
-    strftime(filename, sizeof(filename), "proxy_stats_%Y%m%d_%H%M%S.txt", tm_info);
+            fds[0].fd = fsm->writer_sockfd;
+            fds[0].events = POLLIN;
+            fds[1].fd = fsm->receiver_sockfd;
+            fds[1].events = POLLIN;
 
-    // Call store_statistics here before cleanup
-    store_statistics(filename, &stats);
+            currentState = WAITING_FOR_DATA;
+            printf("Waiting to receive data...\n");
+        }
 
-    // Existing cleanup call
-    cleanup(&proxy_data);
+        // Poll the file descriptors for events
+        poll_result = poll(fds, 2, timeout);
 
-    return fsm.currentState == CLEAN_UP ? EXIT_SUCCESS : EXIT_FAILURE;
-}
+        if (poll_result < 0) {
+            perror("poll error");
+            currentState = HANDLE_ERROR;  // Transition to error handling
+            continue;
+        }
 
-// Signal handler function
-static void handle_signal(int sig) {
-    signal_received = 1;
-}
+        if (poll_result == 0) {
+            printf("Waiting to receive data...\n");
+            currentState = WAITING_FOR_DATA;
+            continue;
+        }
 
-// Function to parse and validate command-line arguments
-static void parse_arguments(FSM *fsm, ProxyData *proxy_data) {
-    int opt;
-    opterr = 0;
+        if (fds[0].revents & POLLIN) {
+            if (receive_data(fsm->writer_sockfd, fsm->writer_addr, fsm->writer_addr_len, fsm->data_buffer, &fsm->numBytes, fsm)) {
+                currentState = FORWARDING_DATA;
+            }
+            fds[0].revents = 0; // Reset the revents field after handling the event
+        }
+        
+        if (fds[1].revents & POLLIN) {
+            if (receive_ack(fsm->writer_sockfd, fsm->receiver_sockfd, fsm->receiver_addr, fsm->receiver_addr_len, fsm)) {
+                currentState = FORWARDING_ACK;
+            }
+            fds[1].revents = 0; // Reset the revents field after handling the event
+        }
 
-    while((opt = getopt(fsm->argc, fsm->argv, "h")) != -1) {
-        switch(opt) {
-        case 'h':
-            usage(fsm->argv[0], EXIT_SUCCESS, NULL);
+        switch(currentState) {
+        case FORWARDING_DATA:
+            printf("Forwarding data to receiver...\n");
+            forward_data(fsm->receiver_sockfd, fsm->receiver_addr, fsm->receiver_addr_len, fsm->data_buffer, fsm->numBytes);
+            currentState = WAITING_FOR_ACK;
             break;
-        case '?':
-            char message[UNKNOWN_OPTION_MESSAGE_LEN];
-            snprintf(message, sizeof(message), "Unknown option '-%c'.", optopt);
-            usage(fsm->argv[0], EXIT_FAILURE, message);
+
+        case FORWARDING_ACK:
+            printf("Forwarding ACK to writer...\n");
+            forward_ack(fsm->writer_sockfd, fsm->writer_addr, fsm->receiver_addr_len, fsm->ack_buffer, fsm->numBytes, fsm);
+            currentState = WAITING_FOR_DATA;
             break;
-        default:
-            usage(fsm->argv[0], EXIT_FAILURE, NULL);
+
+        case HANDLE_ERROR:
+            perror("Handling error");
+            cleanup(fsm->writer_sockfd, fsm->receiver_sockfd);
+            currentState = TERMINATE;
+            break;
+
+        case TERMINATE:
             break;
         }
     }
+    cleanup(fsm->writer_sockfd, fsm->receiver_sockfd);
+    return EXIT_SUCCESS;
+}
 
-    // Check for correct number of arguments
-    if (fsm->argc < 8) {
-        usage(fsm->argv[0], EXIT_FAILURE, "Incorrect number of arguments.");
+// Function to parse and validate command-line arguments
+static void parse_arguments(int argc, char *argv[], char **receiver_ip, in_port_t *writer_port, in_port_t *receiver_port, float *drop_data_chance, float *drop_ack_chance, float *delay_data_chance, float *delay_ack_chance) {
+    if (argc != 8) {
+        fprintf(stderr, "Incorrect number of arguments.\n");
     }
 
-    fsm->receiver_ip = fsm->argv[optind];
-    fsm->receiver_port = parse_in_port_t(fsm->argv[0], fsm->argv[optind + 1]);
-    fsm->writer_port = parse_in_port_t(fsm->argv[0], fsm->argv[optind + 2]);
-    proxy_data->drop_data_chance = atof(fsm->argv[optind + 3]);
-    proxy_data->drop_ack_chance = atof(fsm->argv[optind + 4]);
-    proxy_data->delay_data_chance = atof(fsm->argv[optind + 5]);
-    proxy_data->delay_ack_chance = atof(fsm->argv[optind + 6]);
+    *receiver_ip = argv[optind];
+    printf("Parsing writer port...\n");
+    *receiver_port = parse_in_port_t(argv[0], argv[optind + 1]);
+    printf("Writer port parsed successfully.\n");
+    printf("Parsing receiver port...\n");
+    *writer_port = parse_in_port_t(argv[0], argv[optind + 2]);
+    printf("Receiver port parsed successfully.\n");
+    *drop_data_chance = atof(argv[optind + 3]);
+    *drop_ack_chance = atof(argv[optind + 4]);
+    *delay_data_chance = atof(argv[optind + 5]);
+    *delay_ack_chance = atof(argv[optind + 6]);
 }
 
 // Function to process and validate the command-line arguments
-static void handle_arguments(const char *binary_name, FSM *fsm) {
-    // Check if receiver IP address is provided
-    if (fsm->receiver_ip == NULL) {
-        usage(binary_name, EXIT_FAILURE, "The receiver IP address is required.");
+static void handle_arguments(char *receiver_ip, in_port_t receiver_port, in_port_t writer_port) {
+    printf("Checking arguments...\n");
+    if (receiver_ip == NULL) {
+        fprintf(stderr, "The receiver IP address is required.\n");
     }
 
     // Validate receiver port
-    if (fsm->receiver_port > UINT16_MAX || fsm->receiver_port == 0) {
-        usage(binary_name, EXIT_FAILURE, "Invalid receiver port.");
+    if (receiver_port > UINT16_MAX || receiver_port == 0) {
+        fprintf(stderr, "Invalid receiver port.\n");
     }
-    fsm->receiver_port = fsm->receiver_port;
+    receiver_port = receiver_port;
 
     // Validate writer port
-    if (fsm->writer_port > UINT16_MAX || fsm->writer_port == 0) {
-        usage(binary_name, EXIT_FAILURE, "Invalid writer port.");
+    if (writer_port > UINT16_MAX || writer_port == 0) {
+        fprintf(stderr, "Invalid writer port.\n");
     }
-    fsm->writer_port = fsm->writer_port;
+    writer_port = writer_port;
+    printf("Arguments checked.\n");
 }
 
 // Function to parse port from string
@@ -193,27 +220,17 @@ in_port_t parse_in_port_t(const char *binary_name, const char *str) {
     exit(EXIT_FAILURE);
   }
   if (*endptr != '\0') {
-    usage(binary_name, EXIT_FAILURE, "Invalid characters in input.");
+    fprintf(stderr, "Invalid characters in input.\n");
   }
   if (parsed_value > UINT16_MAX) {
-    usage(binary_name, EXIT_FAILURE, "in_port_t value out of range.");
+    fprintf(stderr, "in_port_t value out of range.\n");
   }
   return (in_port_t)parsed_value;
 }
 
-// Function to display usage information and exit
-_Noreturn static void usage(const char *program_name, int exit_code, const char *message) {
-    if(message) {
-        fprintf(stderr, "%s\n", message);
-    }
-    fprintf(stderr, "Usage: %s [-h] <Receiver IP> <Receiver Port> <Writer Port> <Drop Data %> <Drop Ack %> <Delay Data %> <Delay Ack %>\n", program_name);
-    fputs("Options:\n", stderr);
-    fputs("  -h  Display this help message\n", stderr);
-    exit(exit_code);
-}
-
 // Function to convert a string IP address to a sockaddr structure
 static void convert_address(const char *address, struct sockaddr_storage *addr) {
+    printf("Converting address...\n");
     memset(addr, 0, sizeof(*addr));
     char tmp_address[INET6_ADDRSTRLEN];
     strncpy(tmp_address, address, sizeof(tmp_address));
@@ -239,421 +256,182 @@ static void convert_address(const char *address, struct sockaddr_storage *addr) 
         fprintf(stderr, "%s is not a valid IPv4 or IPv6 address\n", address);
         exit(EXIT_FAILURE);
     }
+    printf("Address converted successfully.\n\n");
 }
 
-// Function to create a socket
+// Function to create a socket and set options
 static int socket_create(int domain, int type, int protocol) {
-  int sockfd;
-  sockfd = socket(domain, type, protocol);
-  if (sockfd == -1) {
-    perror("Socket creation failed");
-    exit(EXIT_FAILURE);
-  }
-  return sockfd;
+    int sockfd;
+    int yes = 1;
+
+    sockfd = socket(domain, type, protocol);
+    if (sockfd == -1) {
+        perror("socket creation failed");
+        exit(EXIT_FAILURE);
+    }
+
+    // Allow the socket to be quickly reused after the application closes
+    if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) == -1) {
+        perror("setsockopt failed");
+        close(sockfd);
+        exit(EXIT_FAILURE);
+    }
+
+    // Set the socket to non-blocking mode
+    int flags = fcntl(sockfd, F_GETFL, 0);
+    if (flags == -1) {
+        perror("fcntl F_GETFL");
+        close(sockfd);
+        exit(EXIT_FAILURE);
+    }
+    flags |= O_NONBLOCK;
+    if (fcntl(sockfd, F_SETFL, flags) == -1) {
+        perror("fcntl F_SETFL O_NONBLOCK");
+        close(sockfd);
+        exit(EXIT_FAILURE);
+    }
+
+    return sockfd;
 }
 
 // Function to bind a socket to an address
-static void socket_bind(int sockfd, struct sockaddr_storage *addr, in_port_t port) {
-  char addr_str[INET6_ADDRSTRLEN];
-  socklen_t addr_len;
-  void *vaddr;
-  in_port_t net_port;
-  net_port = htons(port);
+static int socket_bind(int sockfd, in_port_t port) {
+    struct sockaddr_in6 addr6;
+    struct sockaddr_in addr;
 
-  // Set up the correct address structure based on the family (IPv4 or IPv6)
-  if(addr->ss_family == AF_INET) {
-    struct sockaddr_in *ipv4_addr;
-    ipv4_addr = (struct sockaddr_in *)addr;
-    addr_len = sizeof(*ipv4_addr);
-    ipv4_addr->sin_port = net_port;
-    vaddr = (void *)&(((struct sockaddr_in *)addr)->sin_addr);
-  }
-  else if(addr->ss_family == AF_INET6) {
-    struct sockaddr_in6 *ipv6_addr;
-    ipv6_addr = (struct sockaddr_in6 *)addr;
-    addr_len = sizeof(*ipv6_addr);
-    ipv6_addr->sin6_port = net_port;
-    vaddr = (void *)&(((struct sockaddr_in6 *)addr)->sin6_addr);
-  }
-  else {
-    fprintf(stderr, "Internal error: addr->ss_family must be AF_INET or AF_INET6, was: %d\n", addr->ss_family);
-    exit(EXIT_FAILURE);
-  }
-  // Convert binary address to string for display
-  if(inet_ntop(addr->ss_family, vaddr, addr_str, sizeof(addr_str)) == NULL) {
-    perror("inet_ntop");
-    exit(EXIT_FAILURE);
-  }
-  printf("Binding to: %s:%u\n", addr_str, port);
+    memset(&addr6, 0, sizeof(addr6));
+    addr6.sin6_family = AF_INET6;
+    addr6.sin6_port = htons(port);
+    addr6.sin6_addr = in6addr_any;
 
-  // Bind the socket
-  if(bind(sockfd, (struct sockaddr *)addr, addr_len) == -1) {
-    perror("Binding failed");
-    fprintf(stderr, "Error code: %d\n", errno);
-    exit(EXIT_FAILURE);
-  }
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
-  printf("Bound to socket: %s:%u\n", addr_str, port);
-}
-
-// State transition function for FSM
-static void transition(FSM *fsm, ProxyData *proxy_data) {
-  switch(fsm->currentState) {
-  case INITIALIZE:
-    // Parse and handle arguments to set receiver IP and ports
-    parse_arguments(fsm, proxy_data);
-    handle_arguments(fsm->argv[0], fsm);
-    fsm->currentState = SOCKET_CREATE;
-    break;
-    case SOCKET_CREATE:
-      // Create sockets for writer and receiver
-      proxy_data->writer_sockfd = socket_create(AF_INET, SOCK_DGRAM, 0);
-      proxy_data->receiver_sockfd = socket_create(AF_INET, SOCK_DGRAM, 0);
-      fsm->currentState = BINDING;
-      break;
-    case BINDING:
-      // Convert receiver address and bind receiver socket
-      convert_address(fsm->receiver_ip, &(fsm->addr));
-      socket_bind(proxy_data->receiver_sockfd, &(fsm->addr), fsm->receiver_port);
-      fsm->currentState = THREAD_CREATE;
-      break;
-  case THREAD_CREATE:
-    // Thread creation for idle, resend, and ack handlers
-    if (pthread_create(&fsm->t_idle, NULL, idle_handler, &proxy_data) != 0) {
-        perror("Failed to create idle handler thread");
-        exit(EXIT_FAILURE);
-    }
-    if (pthread_create(&fsm->t_data, NULL, data_handler, &proxy_data) != 0) {
-        perror("Failed to create data handler thread");
-        exit(EXIT_FAILURE);
-    }
-    if (pthread_create(&fsm->t_ack, NULL, ack_handler, &proxy_data) != 0) {
-        perror("Failed to create ack handler thread");
-        exit(EXIT_FAILURE);
-    }
-    fsm->currentState = THREAD_JOIN;
-    break;
-  case THREAD_JOIN:
-    // Joining threads
-    pthread_join(fsm->t_idle, NULL);
-    pthread_join(fsm->t_data, NULL);
-    pthread_join(fsm->t_ack, NULL);
-    fsm->currentState = IDLE;
-    break;
-  case IDLE:
-    idle_handler(&(proxy_data)); 
-    break;
-  case CLEAN_UP:
-    cleanup(proxy_data);
-    break;
-  case HANDLE_ERROR:
-    fsm->currentState = CLEAN_UP;
-    break;
-  default:
-    fprintf(stderr, "Unexpected FSM state\n");
-    fsm->currentState = HANDLE_ERROR;
-    break;
-  }
-}
-
-static void *idle_handler(void *arg) {
-    ProxyData *proxy_data = (ProxyData *)arg;
-    fd_set readfds;
-    struct timeval timeout;
-    int max_sd;
-
-    fcntl(proxy_data->writer_sockfd, F_SETFL, O_NONBLOCK);
-    fcntl(proxy_data->receiver_sockfd, F_SETFL, O_NONBLOCK);
-   
-    while (1) {
-        FD_ZERO(&readfds);
-
-        FD_SET(proxy_data->writer_sockfd, &readfds);
-        FD_SET(proxy_data->receiver_sockfd, &readfds);
-        max_sd = (proxy_data->writer_sockfd > proxy_data->receiver_sockfd) ? proxy_data->writer_sockfd : proxy_data->receiver_sockfd;
-
-        timeout.tv_sec = 1;
-        timeout.tv_usec = 0;
-
-        int activity = select(max_sd + 1, &readfds, NULL, NULL, &timeout);
-
-        if ((activity < 0) && (errno != EINTR)) {
-            perror("select error");
-            break;
-        }
-
-        if (FD_ISSET(proxy_data->writer_sockfd, &readfds)) {
-            receive_data(proxy_data->fsm, proxy_data);
-        }
-
-        if (FD_ISSET(proxy_data->receiver_sockfd, &readfds)) {
-            receive_ack(proxy_data); // Pass proxy_data directly, not its address
-        }
-
-        // Check if signal received
-        if (signal_received) {
-            printf("Signal received, transitioning to cleanup.\n");
-            proxy_data->fsm->currentState = CLEAN_UP;
-            break;
+    // Try IPv6 first
+    if (bind(sockfd, (struct sockaddr *)&addr6, sizeof(addr6)) == -1) {
+        // Try IPv4 if IPv6 fails
+        if (bind(sockfd, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
+            perror("bind failed");
+            return -1;
         }
     }
 
-    cleanup(proxy_data);
-
-    return NULL;
+    return 0; // Success
 }
-
-// Thread function for handling acknowledgment
-static void *ack_handler(void *arg) {
-    ProxyData *proxy_data = (ProxyData *)arg;
-
-    while (1) {
-        drop_or_delay(proxy_data);
-
-        if (proxy_data->drop_ack_decision) {
-            continue;
-        }
-
-        if (proxy_data->delay_ack_decision) {
-            sleep(5);
-        }
-        receive_ack(proxy_data);
-    }
-
-    return NULL;
-}
-
-// Thread function for handling data
-static void *data_handler(void *arg) {
-    ProxyData *proxy_data = (ProxyData *)arg;
-
-    while (1) {
-        drop_or_delay(proxy_data);
-
-        if (proxy_data->drop_data_decision) {
-            continue;
-        }
-
-        if (proxy_data->delay_data_decision) {
-            sleep(5);
-        }
-
-        receive_data(proxy_data->fsm, proxy_data);
-    }
-
-    return NULL;
-}
-
-// Function to indefinitely listen for data sent from the writer
-static void receive_data(FSM *fsm, ProxyData *proxy_data) {
-    char buffer[BUFFER_SIZE];
-    socklen_t addr_len = sizeof(proxy_data->writer_addr);
-
-    while (1) {
-        ssize_t numBytes = recvfrom(proxy_data->writer_sockfd, buffer, BUFFER_SIZE, 0, 
-                            (struct sockaddr *)&proxy_data->writer_addr, &addr_len);
-        if (numBytes < 0) {
-            perror("recvfrom failed");
-            continue;
-        } else {
-            pthread_mutex_lock(&proxy_data->stats->stats_mutex);
-            proxy_data->stats->data_received++;
-            pthread_mutex_unlock(&proxy_data->stats->stats_mutex);
-        }
-
-        forward_data(fsm, proxy_data, buffer, numBytes);
-    }
-}
-
-// Function to indefinitely listen for ack sent from the receiver
-static void receive_ack(ProxyData *proxy_data) {
-    char buffer[BUFFER_SIZE];
-    socklen_t addr_len = sizeof(proxy_data->writer_addr);
-
-    int drop_ack_decision, delay_ack_decision;
-
-    while (1) {
-        ssize_t numBytes = recvfrom(proxy_data->receiver_sockfd, buffer, BUFFER_SIZE, 0, 
-                            (struct sockaddr *)&proxy_data->writer_addr, &addr_len);
-        if (numBytes < 0) {
-            perror("recvfrom failed");
-            continue;
-        } else {
-            pthread_mutex_lock(&proxy_data->stats->stats_mutex);
-            proxy_data->stats->ack_received++;
-            pthread_mutex_unlock(&proxy_data->stats->stats_mutex);
-        }
-
-        forward_ack(proxy_data, buffer, numBytes);
-    }
-}
-
-// Function to determine whether to drop or delay data/ack based on given chances
-static void drop_or_delay(ProxyData *proxy_data) {
-    srand(time(NULL));
-
-    proxy_data->drop_data_decision = (rand() % 100 < proxy_data->drop_data_chance * 100);
-    proxy_data->drop_ack_decision = (rand() % 100 < proxy_data->drop_ack_chance * 100);
-    proxy_data->delay_data_decision = (rand() % 100 < proxy_data->delay_data_chance * 100);
-    proxy_data->delay_ack_decision = (rand() % 100 < proxy_data->delay_ack_chance * 100);
-
-    if (proxy_data->drop_data_decision) {
-        pthread_mutex_lock(&proxy_data->stats->stats_mutex);
-        proxy_data->stats->data_dropped++;
-        pthread_mutex_unlock(&proxy_data->stats->stats_mutex);
-    }
-    if (proxy_data->delay_data_decision) {
-        pthread_mutex_lock(&proxy_data->stats->stats_mutex);
-        proxy_data->stats->data_delayed++;
-        pthread_mutex_unlock(&proxy_data->stats->stats_mutex);
-    }
-    if (proxy_data->drop_ack_decision) {
-        pthread_mutex_lock(&proxy_data->stats->stats_mutex);
-        proxy_data->stats->ack_dropped++;
-        pthread_mutex_unlock(&proxy_data->stats->stats_mutex);
-    }
-    if (proxy_data->delay_ack_decision) {
-        pthread_mutex_lock(&proxy_data->stats->stats_mutex);
-        proxy_data->stats->ack_delayed++;
-        pthread_mutex_unlock(&proxy_data->stats->stats_mutex);
-    }
-}
-
-// Forward data to the receiver
-static void forward_data(FSM *fsm, ProxyData *proxy_data, const char *data, size_t data_len) {
-    struct sockaddr_storage receiver_addr;
-    convert_address(fsm->receiver_ip, &receiver_addr);
-
-    if (receiver_addr.ss_family == AF_INET) {
-        ((struct sockaddr_in *)&receiver_addr)->sin_port = htons(fsm->receiver_port);
-    } else if (receiver_addr.ss_family == AF_INET6) {
-        ((struct sockaddr_in6 *)&receiver_addr)->sin6_port = htons(fsm->receiver_port);
-    }
-
-    ssize_t sent_bytes = sendto(proxy_data->receiver_sockfd, data, data_len, 0, (struct sockaddr *)&receiver_addr, sizeof(receiver_addr));
-    if (sent_bytes < 0) {
-        perror("Failed to send data");
-        fprintf(stderr, "Error sending data: %s\n", strerror(errno));
-        receive_data(fsm, proxy_data);
-    } else {
-        pthread_mutex_lock(&proxy_data->stats->stats_mutex);
-        proxy_data->stats->data_sent++;
-        pthread_mutex_unlock(&proxy_data->stats->stats_mutex);
-    }
-}
-
-static void forward_ack(ProxyData *proxy_data, const char *ack_data, size_t ack_data_len) {
-    ssize_t sent_bytes = sendto(proxy_data->writer_sockfd, ack_data, ack_data_len, 0, (struct sockaddr *)&(proxy_data->writer_addr), sizeof(proxy_data->writer_addr));
-    if (sent_bytes < 0) {
-        perror("Failed to send acknowledgement");
-        fprintf(stderr, "Error sending acknowledgement: %s\n", strerror(errno));
-        receive_ack(proxy_data);
-    } else {
-        pthread_mutex_lock(&proxy_data->stats->stats_mutex);
-        proxy_data->stats->ack_sent++;
-        pthread_mutex_unlock(&proxy_data->stats->stats_mutex);
-    }
-}
-
-// Function to store data statistics in a file
-static void store_statistics(const char *filename, Statistics *stats) {
-    FILE *file = NULL;
-    int attempts = 0;
-    const int max_attempts = 3;
-
-    while (!file && attempts < max_attempts) {
-        file = fopen(filename, "w");
-        if (!file) {
-            perror("Failed to open statistics file");
-            fprintf(stderr, "Retrying to open file: %s\n", filename);
-            attempts++;
-            sleep(1); // Wait a bit before retrying
-        }
-    }
-
-    if (!file) {
-        fprintf(stderr, "Unable to open file %s after %d attempts\n", filename, max_attempts);
-        return;
-    }
-
-    fprintf(file, "Data Sent: %lu\n", stats->data_sent);
-    fprintf(file, "Data Received: %lu\n", stats->data_received);
-    fprintf(file, "Data Dropped: %lu\n", stats->data_dropped);
-    fprintf(file, "Data Delayed: %lu\n", stats->data_delayed);
-    fprintf(file, "Ack Sent: %lu\n", stats->ack_sent);
-    fprintf(file, "Ack Received: %lu\n", stats->ack_received);
-    fprintf(file, "Ack Dropped: %lu\n", stats->ack_dropped);
-    fprintf(file, "Ack Delayed: %lu\n", stats->ack_delayed);
-
-    fclose(file);
-}
-
-
-static void send_statistics(ProxyData *proxy_data) {
-    int gui_sockfd;
-    struct sockaddr_storage gui_addr;
-
-    // Convert GUI address
-    convert_address(GUI_IP, &gui_addr);
-
-    // Determine socket type (IPv4 or IPv6) and set port
-    if (gui_addr.ss_family == AF_INET) {
-        ((struct sockaddr_in*)&gui_addr)->sin_port = htons(GUI_PORT);
-    } else if (gui_addr.ss_family == AF_INET6) {
-        ((struct sockaddr_in6*)&gui_addr)->sin6_port = htons(GUI_PORT);
-    } else {
-        fprintf(stderr, "Unsupported address family\n");
-        exit(EXIT_FAILURE);
-    }
-
-    // Create TCP socket
-    gui_sockfd = socket(gui_addr.ss_family, SOCK_STREAM, 0);
-    if (gui_sockfd < 0) {
-        perror("Failed to create socket");
-        exit(EXIT_FAILURE);
-    }
-
-    // Connect the socket to the GUI server
-    if (connect(gui_sockfd, (struct sockaddr *)&gui_addr,
-                gui_addr.ss_family == AF_INET ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6)) < 0) {
-        perror("Connect failed");
-        close(gui_sockfd);
-        exit(EXIT_FAILURE);
-    }
-
-    // Convert statistics to a string format
-    char stats_buffer[1024];
-    snprintf(stats_buffer, sizeof(stats_buffer), "%lu,%lu", proxy_data->stats->data_sent, proxy_data->stats->data_received);
-
-    // Send the statistics
-    if (send(gui_sockfd, stats_buffer, strlen(stats_buffer), 0) < 0) {
-        perror("Failed to send statistics");
-        close(gui_sockfd);
-        exit(EXIT_FAILURE);
-    }
-
-    // Close the socket
-    close(gui_sockfd);
-}
-
 
 // Function to perform cleanup, particularly closing sockets
-static void cleanup(ProxyData *proxy_data) {
-    if (proxy_data->writer_sockfd != -1) {
-        socket_close(proxy_data->writer_sockfd);
-        proxy_data->writer_sockfd = -1;
+static void cleanup(int writer_sockfd, int receiver_sockfd) {
+    printf("Cleaning up...\n");
+    if (writer_sockfd != -1 && fcntl(writer_sockfd, F_GETFD) != -1) {
+        socket_close(writer_sockfd);
+        writer_sockfd = -1;
     }
-    if (proxy_data->receiver_sockfd != -1) {
-        socket_close(proxy_data->receiver_sockfd);
-        proxy_data->receiver_sockfd = -1;
+    if (receiver_sockfd != -1 && fcntl(receiver_sockfd, F_GETFD) != -1) {
+        socket_close(receiver_sockfd);
+        receiver_sockfd = -1;
     }
+    printf("Cleaned up.\n");
 }
 
 // Function to close a socket
 static void socket_close(int sockfd) {
+  printf("Closing socket...\n");
   if(close(sockfd) == -1)
   {
     perror("Error closing socket");
     exit(EXIT_FAILURE);
   }
+  printf("Socket closed.\n");
+}
+
+static bool receive_data(int writer_sockfd, struct sockaddr_storage writer_addr, socklen_t writer_addr_len, char *data_buffer, size_t *numBytes, FSM *fsm) {
+    *numBytes = recvfrom(writer_sockfd, data_buffer, BUFFER_SIZE - 1, 0, (struct sockaddr *)&writer_addr, &writer_addr_len);
+    if (*numBytes == -1) {
+        if (errno == EWOULDBLOCK || errno == EAGAIN) {
+            // No data available yet
+            return false;
+        }
+        perror("recvfrom failed");
+        exit(EXIT_FAILURE);
+    }
+    fsm->writer_addr = writer_addr;
+    fsm->writer_addr_len = writer_addr_len;
+
+    data_buffer[*numBytes] = '\0';
+    printf("Received %zd bytes: %s\n", *numBytes, data_buffer);
+
+    if (!drop_or_delay_data(fsm->drop_data_chance, fsm->delay_data_chance, data_buffer, *numBytes)) {
+        return true; // Data should be forwarded
+    }
+    return false; // Data is dropped or delayed
+}
+
+
+static bool receive_ack(int writer_sockfd, int receiver_sockfd, struct sockaddr_storage receiver_addr, socklen_t receiver_addr_len, FSM *fsm) {
+    printf("Waiting to receive ACK...\n");
+    fsm->numBytes = recvfrom(receiver_sockfd, fsm->ack_buffer, BUFFER_SIZE - 1, 0, (struct sockaddr *)&receiver_addr, &receiver_addr_len);
+    if (fsm->numBytes == -1) {
+        perror("recvfrom failed for ACK");
+        exit(EXIT_FAILURE);
+    }
+
+    fsm->ack_buffer[fsm->numBytes] = '\0';
+    printf("Received ACK: %s\n\n", fsm->ack_buffer);
+
+    if (!drop_or_delay_ack(fsm->drop_ack_chance, fsm->delay_ack_chance, fsm->ack_buffer, fsm->numBytes)) {
+        return true;
+    }
+    return false;
+}
+
+static bool drop_or_delay_data(float drop_chance, float delay_chance, char *data, size_t data_len) {
+    float rand_percent = ((float)rand() / RAND_MAX) * 100;
+    if (rand_percent < drop_chance) {
+        printf("Data dropped.\n\n");
+        return true;
+    } else if (rand_percent < drop_chance + delay_chance) {
+        // Delay the data packet
+        int delay_time_ms = (int)((rand_percent - drop_chance) / delay_chance * 1000);
+        printf("Delaying data for %d ms.\n\n", delay_time_ms);
+        usleep(delay_time_ms * 1000); // Convert milliseconds to microseconds for usleep
+    }
+    return false;
+}
+
+static bool drop_or_delay_ack(float drop_chance, float delay_chance, char *ack, size_t ack_len) {
+    float rand_percent = ((float)rand() / RAND_MAX) * 100;
+    if (rand_percent < drop_chance) {
+        printf("ACK dropped.\n\n");
+        return true;
+    } else if (rand_percent < drop_chance + delay_chance) {
+        // Delay the ACK packet
+        int delay_time_ms = (int)((rand_percent - drop_chance) / delay_chance * 1000);
+        printf("Delaying ACK for %d ms.\n\n", delay_time_ms);
+        usleep(delay_time_ms * 1000); // Convert milliseconds to microseconds for usleep
+    }
+    return false;
+}
+
+static void forward_data(int receiver_sockfd, struct sockaddr_storage receiver_addr, socklen_t receiver_addr_len, const char *data, size_t data_len) {
+    // Attempt to send the data
+    ssize_t numBytes = sendto(receiver_sockfd, data, data_len, 0, (struct sockaddr *)&receiver_addr, receiver_addr_len);
+    if (numBytes < 0) {
+        perror("sendto failed - error");
+        printf("Error code: %d\n", errno);
+        exit(EXIT_FAILURE);
+    }
+
+    printf("Data forwarded to receiver.\n\n");
+}
+
+static void forward_ack(int writer_sockfd, struct sockaddr_storage writer_addr, socklen_t writer_addr_len, const char *ack, size_t ack_len, FSM *fsm) {
+    ssize_t numBytes = sendto(writer_sockfd, ack, ack_len, 0, (struct sockaddr *)&fsm->writer_addr, fsm->writer_addr_len);
+    if (numBytes < 0) {
+        perror("sendto failed for ACK");
+        printf("Error code: %d\n", errno);
+        exit(EXIT_FAILURE);
+    }
+    printf("ACK forwarded to writer.\n\n");
 }
