@@ -9,8 +9,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-
-	// "strings"
 	"sync"
 	"time"
 )
@@ -81,7 +79,7 @@ type WriterFSM struct {
 }
 
 const (
-	ValidateArgs WriterState = iota
+	Init WriterState = iota
 	CreateSocket
 	SyncronizeServer
 	Transmitting
@@ -97,7 +95,7 @@ const (
 /////////////////////define Methods for WriterFSM for state transitions/////////////////////////
 func NewWriterFSM() *WriterFSM {
 	return &WriterFSM{
-		currentState: ValidateArgs,
+		currentState: Init,
 		maxRetries: maxRetries,
 		stdinReader: bufio.NewReader(os.Stdin),
 		responseChan: make(chan []byte),
@@ -118,7 +116,7 @@ func NewWriterFSM() *WriterFSM {
 	}
 }
 
-func (fsm *WriterFSM) ValidateArgsState() WriterState {
+func (fsm *WriterFSM) init_State() WriterState {
 	if (len(os.Args) != args) {
 
 		fsm.err = errors.New("invalid number of arguments, <ip> <port>")
@@ -135,7 +133,7 @@ func (fsm *WriterFSM) ValidateArgsState() WriterState {
 	return CreateSocket
 }
 
-func (fsm *WriterFSM) CreateSocketState() WriterState {
+func (fsm *WriterFSM) create_socket_state() WriterState {
 	addr := &net.UDPAddr{IP: fsm.ip, Port: fsm.port}
 	fsm.udpcon, fsm.err = net.DialUDP("udp", nil, addr)
 	if fsm.err != nil {
@@ -144,10 +142,10 @@ func (fsm *WriterFSM) CreateSocketState() WriterState {
 	return SyncronizeServer
 }
 
-func (fsm *WriterFSM) SyncronizeServerState() WriterState {
+func (fsm *WriterFSM) syncronize_server_state() WriterState {
 	fsm.wg.Add(2)
 
-	go fsm.listenResponse(1000 * time.Millisecond)
+	go fsm.listenResponse(fsm.timeoutDuration)
 	go fsm.sendPacket()
 	for {
 		packet := createPacket(fsm.ack, fsm.seq, FLAG_SYN, "")
@@ -171,7 +169,7 @@ func (fsm *WriterFSM) SyncronizeServerState() WriterState {
 
 /////////////////////////////////////////////Transmitting State////////////////////////////////////////
 
-func (fsm *WriterFSM) TransmittingState() WriterState {
+func (fsm *WriterFSM) transmitting_state() WriterState {
 	fmt.Println("Transmitting")
 	if !fsm.isStdInStarted {
 		go fsm.readStdin()
@@ -195,7 +193,7 @@ func (fsm *WriterFSM) TransmittingState() WriterState {
 	}
 }
 
-func (fsm *WriterFSM) ReTransmittingState() WriterState {
+func (fsm *WriterFSM) retransmitting_state() WriterState {
 	fmt.Println("ReTransmitting")
 
 	for i := 0; i < maxRetries; i++ {
@@ -219,7 +217,8 @@ func (fsm *WriterFSM) ReTransmittingState() WriterState {
 
 }
 
-func (fsm *WriterFSM) ErrorHandlingState() WriterState {
+
+func (fsm *WriterFSM) error_handling_state() WriterState {
 	fmt.Println("Error:", fsm.err)
 	close(fsm.stopChan) //notify all goroutines to stop
 	fmt.Println("Error before wait ")
@@ -229,7 +228,7 @@ func (fsm *WriterFSM) ErrorHandlingState() WriterState {
 }
 
 
-func (fsm *WriterFSM) RecoverState() WriterState {
+func (fsm *WriterFSM) recover_state() WriterState {
 	fsm.stopChan = make(chan struct{})
 	fmt.Println("Recovering")
 	return SyncronizeServer
@@ -238,14 +237,15 @@ func (fsm *WriterFSM) RecoverState() WriterState {
 
 
 
-func (fsm *WriterFSM) FatalErrorState() WriterState {
+func (fsm *WriterFSM) fatal_error_state() WriterState {
 	fmt.Println("Fatal Error:", fsm.err)
 	return Termination
 }
 
 
 
-func (fsm *WriterFSM) CloseConnectionByServerState() WriterState {
+func (fsm *WriterFSM) close_connection_by_server_state() WriterState {
+	defer fsm.udpcon.Close()
 	fmt.Println("Closing connection by server")
 	close(fsm.stopChan)
 	fsm.wg.Wait()
@@ -257,7 +257,7 @@ func (fsm *WriterFSM) CloseConnectionByServerState() WriterState {
 		packet, _ := json.Marshal(createPacket(fsm.ack, fsm.seq, FLAG_FIN|FLAG_ACK, ""))
 		_, err := fsm.udpcon.Write(packet)
 		if err != nil {
-
+			
 			return Exit
 		}
 		select {
@@ -293,54 +293,51 @@ func (fsm *WriterFSM) CloseConnectionByServerState() WriterState {
 	return Exit
 }
 
-func (fsm *WriterFSM)TerminateState() WriterState {
+func (fsm *WriterFSM)terminate_state() WriterState {
 	close(fsm.stopChan)
 	fmt.Println("closing go routines")
 	fsm.wg.Wait()
 	fmt.Println("all goroutines closed")
+	if fsm.udpcon != nil {
 	fsm.udpcon.Close()
+	}
 	return Exit
 }
 
-func (fsm *WriterFSM) ExitState() {
+func (fsm *WriterFSM) exit_state() {
 	fmt.Println("Client Exiting...")
 }
 
 /////////////////////////////run function for WriterFSM////////////////////////////
 func (fsm *WriterFSM) Run() {
 	for {
-		 select{
-		 case  err := <-fsm.errorChan:
-			  fsm.err = err
-			  fsm.currentState = ErrorHandling
 
-		 default:
 			switch fsm.currentState {
-			case ValidateArgs:
-				fsm.currentState = fsm.ValidateArgsState()
+			case Init:
+				fsm.currentState = fsm.init_State()
 			case CreateSocket:
-				fsm.currentState = fsm.CreateSocketState()
+				fsm.currentState = fsm.create_socket_state()
 			case SyncronizeServer:
-				fsm.currentState = fsm.SyncronizeServerState()
+				fsm.currentState = fsm.syncronize_server_state()
 			case Transmitting:
-				fsm.currentState = fsm.TransmittingState()
+				fsm.currentState = fsm.transmitting_state()
 			case ReTransmitting:
-				fsm.currentState = fsm.ReTransmittingState()
+				fsm.currentState = fsm.retransmitting_state()
 			case ErrorHandling:
-				fsm.currentState = fsm.ErrorHandlingState()
+				fsm.currentState = fsm.error_handling_state()
 			case CloseConnectionByServer:
-				fsm.currentState = fsm.CloseConnectionByServerState()
+				fsm.currentState = fsm.close_connection_by_server_state()
 			case Recover:
-				fsm.currentState = fsm.RecoverState()
+				fsm.currentState = fsm.recover_state()
 			case FatalError:
-				fsm.currentState = fsm.FatalErrorState()
+				fsm.currentState = fsm.fatal_error_state()
 			case Termination:
-				fsm.currentState = fsm.TerminateState()
+				fsm.currentState = fsm.terminate_state()
 			case Exit:
-				fsm.ExitState()
+				fsm.exit_state()
 				return
 			}
-		 }
+
 	}
 }
 
@@ -464,7 +461,6 @@ func (fsm *WriterFSM) sendPacket() {
 
 
 func (fsm *WriterFSM) resendPacket() {
-	// defer fsm.wg.Done()
 	fsm.lastPacketMutex.Lock()
 					packet := make([]byte, len(fsm.lastPacket))
 					copy(packet, fsm.lastPacket)
