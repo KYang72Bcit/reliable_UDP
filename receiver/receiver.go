@@ -9,7 +9,6 @@ import (
 	"os/signal"
 	"strconv"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -30,7 +29,7 @@ const (
 
 const (
 	args = 3
-	maxRetries = 5
+	maxRetries = 3
 	bufferSize = 512
 	packetBufferSize = 50
 )
@@ -55,7 +54,7 @@ type Header struct {
 type ReceiverState int
 
 const (
-	Initialization ReceiverState = iota
+	Init ReceiverState = iota
 	CreateSocket
 	ReadyForReceiving
 	Receiving
@@ -80,8 +79,8 @@ type ReceiverFSM struct {
 	resendChan chan struct{}
 	quitChan chan os.Signal
 	wg sync.WaitGroup
-	shouldRun int32
 	clientAddr *net.UDPAddr
+	maxRetries int
 
 }
 
@@ -89,20 +88,20 @@ type ReceiverFSM struct {
 func NewReceiverFSM() *ReceiverFSM {
 
 	return &ReceiverFSM{
-		currentState: Initialization,
+		currentState: Init,
 		seqNum: 0,
 		ackNum: 0,
-		shouldRun: 1,
 		stopChan: make(chan struct{}),
 		errorChan: make(chan error),
 		responseChan: make(chan []byte),
 		resendChan: make(chan struct{}),
 		outputChan: make(chan CustomPacket, packetBufferSize),
-		quitChan: make(chan os.Signal, 1), //channel for handling ctrl+c
+		quitChan: make(chan os.Signal, 1),
+		maxRetries: maxRetries,
 	}
 }
 
-func (fsm *ReceiverFSM) InitializationState() ReceiverState {
+func (fsm *ReceiverFSM) init_state() ReceiverState {
 	signal.Notify(fsm.quitChan, syscall.SIGINT)
 	go fsm.handleQuit()
 	if (len(os.Args) != args) {
@@ -121,24 +120,19 @@ func (fsm *ReceiverFSM) InitializationState() ReceiverState {
 }
 
 
-func (fsm *ReceiverFSM) CreateSocketState() ReceiverState {
+func (fsm *ReceiverFSM) create_socket_state() ReceiverState {
 
-	if atomic.LoadInt32(&fsm.shouldRun) == 0 {
-		return Termination
-	}
 	addr := &net.UDPAddr{IP: fsm.ip, Port: fsm.port}
 	fsm.udpcon, fsm.err = net.ListenUDP("udp", addr)
-	if fsm.err != nil {
-		if opErr, ok := fsm.err.(*net.OpError); ok && (opErr.Op == "accept" || opErr.Op == "close") {
-			fmt.Println("Server closed connection")
+	 if fsm.err != nil {
 			return Termination
-		}
 	}
+	
 	fmt.Println("UDP server listening on", fsm.udpcon.LocalAddr().String())
 	return ReadyForReceiving
 }
 
-func (fsm *ReceiverFSM) ReadyForReveivingState() ReceiverState {
+func (fsm *ReceiverFSM) ready_for_receiving_state() ReceiverState {
 	fsm.wg.Add(3)
 	go fsm.printToConsole()
 	go fsm.listenResponse()
@@ -147,7 +141,7 @@ func (fsm *ReceiverFSM) ReadyForReveivingState() ReceiverState {
 
 }
 
-func (fsm *ReceiverFSM) recoverState() ReceiverState {
+func (fsm *ReceiverFSM) recover_state() ReceiverState {
 	fmt.Println("Recover")
 	fsm.stopChan = make(chan struct{})
 	fsm.wg.Add(3)
@@ -157,7 +151,7 @@ func (fsm *ReceiverFSM) recoverState() ReceiverState {
 	return Receiving
 }
 
-func (fsm *ReceiverFSM) ReceivingState() ReceiverState {
+func (fsm *ReceiverFSM) receiving_state() ReceiverState {
 	
 	for {
 		select {
@@ -168,11 +162,9 @@ func (fsm *ReceiverFSM) ReceivingState() ReceiverState {
 
 		}
 	}
-
-
 }
 
-func (fsm *ReceiverFSM) HandleErrorState() ReceiverState{
+func (fsm *ReceiverFSM) handle_error_state() ReceiverState{
 	fmt.Println("Error:", fsm.err)
 		close(fsm.stopChan)
 		fsm.wg.Wait()
@@ -180,15 +172,42 @@ func (fsm *ReceiverFSM) HandleErrorState() ReceiverState{
 
 }
 
-func (fsm *ReceiverFSM) FatalErrorState() ReceiverState{
+func (fsm *ReceiverFSM) fatal_error_state() ReceiverState{
 	fmt.Println("Fatal Error:", fsm.err)
 	return Termination
 
 }
+
  
-func (fsm *ReceiverFSM) TerminationState() {
+func (fsm *ReceiverFSM) termination_state() {
 	fsm.wg.Wait()
-	fsm.udpcon.Close()
+	if fsm.udpcon != nil && fsm.clientAddr != nil{
+	for i := 0; i < maxRetries; i++{
+		sendPacket(fsm.ackNum, fsm.seqNum, FLAG_FIN, "", fsm.udpcon, fsm.clientAddr)
+		fsm.udpcon.SetReadDeadline(time.Now().Add(2000 * time.Millisecond))
+		buffer := make([]byte, bufferSize)
+		n, _, err := fsm.udpcon.ReadFromUDP(buffer)
+				if err != nil {
+					if netErr, ok := err.(net.Error); ok && netErr.Timeout(){
+						continue
+					}
+					fsm.errorChan <- err
+					fmt.Println("listenResponse get error")
+					return
+				}
+				if n > 0 {
+				rawPacket := buffer[:n]
+				_, header, _ := parsePacket(rawPacket)
+				if isFINACKPacket(header) {
+					break
+				}
+				}					
+		}
+		fsm.udpcon.Close()
+
+	}
+	
+	
 	fmt.Println("UDP server exiting...")
 	
 }
@@ -196,22 +215,22 @@ func (fsm *ReceiverFSM) TerminationState() {
 func (fsm *ReceiverFSM) Run() {
 	for {
 		switch fsm.currentState {
-			case Initialization:
-				fsm.currentState = fsm.InitializationState()
+			case Init:
+				fsm.currentState = fsm.init_state()
 			case CreateSocket:
-				fsm.currentState = fsm.CreateSocketState()
+				fsm.currentState = fsm.create_socket_state()
 			case ReadyForReceiving:
-				fsm.currentState = fsm.ReadyForReveivingState()
+				fsm.currentState = fsm.ready_for_receiving_state()
 			case Receiving:
-				fsm.currentState = fsm.ReceivingState()
+				fsm.currentState = fsm.receiving_state()
 			case HandleError:
-				fsm.currentState = fsm.HandleErrorState()
+				fsm.currentState = fsm.handle_error_state()
 			case Recover:
-				fsm.currentState = fsm.recoverState()
+				fsm.currentState = fsm.recover_state()
 			case FatalError:
-				fsm.currentState = fsm.FatalErrorState()
+				fsm.currentState = fsm.fatal_error_state()
 			case Termination:
-				fsm.TerminationState()
+				fsm.termination_state()
 				return
 		}
 	}
@@ -260,13 +279,16 @@ func (fsm *ReceiverFSM) confirmPacket() {
 			case rawPacket := <- fsm.responseChan:
 				packet, header, err := parsePacket(rawPacket)
 				if err != nil {
-					fmt.Println("error in confirmPacket")
 					fsm.errorChan <- err
+				}
+				if isSYNPacket(header){
+					fsm.ackNum = header.SeqNum
 				}
 				if isValidPacket(header, fsm.ackNum, fsm.seqNum) {
 					fsm.outputChan <- *packet
 					fsm.ackNum += header.DataLen
 				}
+			
 				if fsm.clientAddr != nil {
 					sendPacket(fsm.ackNum, fsm.seqNum, FLAG_ACK, "", fsm.udpcon, fsm.clientAddr)
 				} else {
@@ -297,7 +319,6 @@ func (fsm *ReceiverFSM) printToConsole() {
 func (fsm *ReceiverFSM) handleQuit() {
 		<- fsm.quitChan
 		fmt.Println("Received Ctrl+C, shutting down...")
-		atomic.StoreInt32(&fsm.shouldRun, 0)
 		close(fsm.stopChan)
 }
 	
@@ -327,10 +348,20 @@ func isValidPacket(header *Header , ackNum uint32, seqNum uint32) bool {
 	return header.SeqNum == ackNum
 
 }
+func isSYNPacket(header *Header) bool {
+	return header.Flags == FLAG_SYN
+}
+
+func isFINPacket(header *Header) bool {
+	return header.Flags == FLAG_FIN
+}
+func isFINACKPacket(header *Header) bool {
+	return header.Flags == FLAG_ACK|FLAG_FIN
+}
 
 func parsePacket(response []byte) (*CustomPacket, *Header, error) {
 	var packet CustomPacket
-	fmt.Println(string(response))
+	fmt.Println("Receive Packet" + string(response))
 	err := json.Unmarshal(response, &packet)
 	if err != nil {
 		return &CustomPacket{}, &Header{}, err
@@ -360,7 +391,7 @@ func sendPacket(ack uint32, seq uint32, flags byte, data string, udpcon *net.UDP
 		if err != nil {
 			fmt.Println(err)
 		}
-
+	fmt.Println("Send Packet" + string(packet))
 	return len(data), err
 
 }
