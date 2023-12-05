@@ -76,7 +76,6 @@ type ReceiverFSM struct {
 	errorChan chan error
 	responseChan chan []byte
 	outputChan chan CustomPacket
-	resendChan chan struct{}
 	quitChan chan os.Signal
 	wg sync.WaitGroup
 	clientAddr *net.UDPAddr
@@ -94,7 +93,6 @@ func NewReceiverFSM() *ReceiverFSM {
 		stopChan: make(chan struct{}),
 		errorChan: make(chan error),
 		responseChan: make(chan []byte),
-		resendChan: make(chan struct{}),
 		outputChan: make(chan CustomPacket, packetBufferSize),
 		quitChan: make(chan os.Signal, 1),
 		maxRetries: maxRetries,
@@ -125,7 +123,7 @@ func (fsm *ReceiverFSM) create_socket_state() ReceiverState {
 	addr := &net.UDPAddr{IP: fsm.ip, Port: fsm.port}
 	fsm.udpcon, fsm.err = net.ListenUDP("udp", addr)
 	 if fsm.err != nil {
-			return Termination
+			return FatalError
 	}
 	
 	fmt.Println("UDP server listening on", fsm.udpcon.LocalAddr().String())
