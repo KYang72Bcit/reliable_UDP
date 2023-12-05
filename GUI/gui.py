@@ -1,9 +1,19 @@
+import os
 import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.ticker import MaxNLocator
 
+# Get the current script's directory
+script_dir = os.path.dirname(os.path.abspath(__file__))
+
+# Get the parent directory of the current script's directory
+parent_dir = os.path.dirname(script_dir)
+
+# Specify the relative path to the CSV file inside the "proxy" folder
+csv_file_path = os.path.join(parent_dir, 'proxy', 'Proxy Statistics.csv')
+
 # Load the CSV file into a Pandas DataFrame
-df = pd.read_csv('Proxy Statistics.csv')
+df = pd.read_csv(csv_file_path)
 
 # Prepend '00:' to 'Time Elapsed' to convert it into 'HH:MM:SS' format
 df['Time Elapsed'] = '00:' + df['Time Elapsed']
