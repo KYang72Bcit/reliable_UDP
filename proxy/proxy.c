@@ -140,7 +140,10 @@ static void initialize_fsm_instance(FSM *fsm, int argc, char *argv[], struct pol
 
     fsm->writer_sockfd = socket_create(fsm); // Create a socket for the writer and store the file descriptor.
     fsm->receiver_sockfd = socket_create(fsm); // Create a socket for the receiver and store the file descriptor.
-    socket_bind(fsm->writer_sockfd, fsm->proxy_ip, fsm->proxy_port); 
+    if (socket_bind(fsm->writer_sockfd, fsm->proxy_ip, fsm->proxy_port) == -1) {
+        perror("Failed to bind proxy socket");
+        exit(EXIT_FAILURE);
+    }
     ((struct sockaddr_in*)&fsm->receiver_addr)->sin_port = htons(fsm->receiver_port); // Set the receiver's port in the address structure.
 
     fds[0].fd = fsm->writer_sockfd; // Set the file descriptor for the writer's socket in the polling array.
