@@ -418,7 +418,6 @@ func (fsm *WriterFSM) sendPacket() {
 				fsm.errorChan <- err
 				return
 			}
-			
 			fsm.lastResponseMutex.Lock()
 			fsm.isLastPacketACKReceived = false
 			fsm.lastResponseMutex.Unlock()
