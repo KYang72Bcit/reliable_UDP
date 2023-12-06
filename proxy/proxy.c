@@ -65,7 +65,7 @@ static void handle_arguments(FSM *fsm); // Declaration of a function to handle t
 in_port_t parse_in_port_t(FSM *fsm, const char *str); // Declaration of a function to parse a port number from a string.
 static void convert_address(FSM *fsm); // Declaration of a function to convert address information.
 static int socket_create(FSM *fsm); // Declaration of a function to create a socket.
-static int socket_bind(int sockfd, const char* ip, in_port_t port);
+static int socket_bind(int sockfd, const char *ip, in_port_t port);
 ProxyState transition(FSM *fsm, struct pollfd fds[]); // Declaration of a function for state transitions in the FSM.
 static bool receive_data(FSM *fsm); // Declaration of a function to receive data.
 static bool drop_or_delay_data(FSM *fsm); // Declaration of a function to decide whether to drop or delay incoming data.
@@ -138,20 +138,10 @@ static void initialize_fsm_instance(FSM *fsm, int argc, char *argv[], struct pol
     printf("Delay Data Chance: %.2f%%\n", fsm->delay_data_chance);
     printf("Delay Ack Chance: %.2f%%\n\n", fsm->delay_ack_chance);
 
-    // Bind the writer's socket
-    fsm->writer_sockfd = socket_create(fsm);
-    if (socket_bind(fsm->writer_sockfd, fsm->writer_ip, fsm->writer_port) == -1) {
-        perror("Failed to bind writer socket");
-        exit(EXIT_FAILURE);
-    }
-
-    // Bind the receiver's socket
-    fsm->receiver_sockfd = socket_create(fsm);
-    if (socket_bind(fsm->receiver_sockfd, fsm->receiver_ip, fsm->receiver_port) == -1) {
-        perror("Failed to bind receiver socket");
-        exit(EXIT_FAILURE);
-    }
-    //((struct sockaddr_in*)&fsm->receiver_addr)->sin_port = htons(fsm->receiver_port); // Set the receiver's port in the address structure.
+    fsm->writer_sockfd = socket_create(fsm); // Create a socket for the writer and store the file descriptor.
+    fsm->receiver_sockfd = socket_create(fsm); // Create a socket for the receiver and store the file descriptor.
+    socket_bind(fsm->writer_sockfd, fsm->writer_ip, fsm->writer_port); // Bind the writer's socket to its port.
+    ((struct sockaddr_in*)&fsm->receiver_addr)->sin_port = htons(fsm->receiver_port); // Set the receiver's port in the address structure.
 
     fds[0].fd = fsm->writer_sockfd; // Set the file descriptor for the writer's socket in the polling array.
     fds[0].events = POLLIN; // Set the event type to POLLIN (there is data to read).
@@ -365,41 +355,42 @@ static int socket_create(FSM *fsm) {
     return sockfd;
 }
 
-// Function to bind a socket to an IP address and port
 static int socket_bind(int sockfd, const char *ip, in_port_t port) {
-    struct sockaddr_storage addr_storage = {0};
-    struct sockaddr *addr = (struct sockaddr *)&addr_storage;
-    socklen_t addr_len;
+    struct sockaddr_in addr4;
+    struct sockaddr_in6 addr6;
+    void *addr;
+    int addr_len;
 
-    // Check if IP is IPv4 or IPv6 and prepare the sockaddr structure
-    if (strchr(ip, ':')) {  // IPv6
-        struct sockaddr_in6 *addr6 = (struct sockaddr_in6 *)&addr_storage;
-        addr6->sin6_family = AF_INET6;
-        addr6->sin6_port = htons(port);
-        if (inet_pton(AF_INET6, ip, &addr6->sin6_addr) <= 0) {
-            perror("inet_pton - IPv6");
+    if (strchr(ip, ':') != NULL) { // This is an IPv6 address
+        memset(&addr6, 0, sizeof(addr6));
+        addr6.sin6_family = AF_INET6;
+        addr6.sin6_port = htons(port);
+        if (inet_pton(AF_INET6, ip, &addr6.sin6_addr) != 1) {
+            perror("inet_pton failed for IPv6");
             return -1;
         }
-        addr_len = sizeof(struct sockaddr_in6);
-    } else {  // IPv4
-        struct sockaddr_in *addr4 = (struct sockaddr_in *)&addr_storage;
-        addr4->sin_family = AF_INET;
-        addr4->sin_port = htons(port);
-        if (inet_pton(AF_INET, ip, &addr4->sin_addr) <= 0) {
-            perror("inet_pton - IPv4");
+        addr = &addr6;
+        addr_len = sizeof(addr6);
+    } else { // This is an IPv4 address
+        memset(&addr4, 0, sizeof(addr4));
+        addr4.sin_family = AF_INET;
+        addr4.sin_port = htons(port);
+        if (inet_pton(AF_INET, ip, &addr4.sin_addr) != 1) {
+            perror("inet_pton failed for IPv4");
             return -1;
         }
-        addr_len = sizeof(struct sockaddr_in);
+        addr = &addr4;
+        addr_len = sizeof(addr4);
     }
 
-    // Bind the socket to the address and port
-    if (bind(sockfd, addr, addr_len) == -1) {
-        perror("bind");
+    if (bind(sockfd, (struct sockaddr *)addr, addr_len) == -1) {
+        perror("bind failed");
         return -1;
     }
 
-    return 0;  // Success
+    return 0; // Success
 }
+
 
 ProxyState transition(FSM *fsm, struct pollfd fds[]) {
     switch(fsm->currentState) {
@@ -638,4 +629,3 @@ static int socket_close(int sockfd) {
     printf("Socket closed.\n");
     return 0;
 }
-
