@@ -43,9 +43,9 @@ typedef struct {
     ssize_t numBytes; // Number of bytes transmitted.
     time_t start_time; // Start time of the operation.
     ProxyState currentState; // Current state of the finite state machine.
-    char *receiver_ip, *writer_ip, **argv; // Receiver IP address and argument vector.
+    char *receiver_ip, *proxy_ip, **argv; // Receiver IP address and argument vector.
     pthread_mutex_t stats_mutex; // Mutex for protecting shared data.
-    in_port_t writer_port, receiver_port; // Ports for the writer and receiver.
+    in_port_t proxy_port, receiver_port; // Ports for the writer and receiver.
     socklen_t writer_addr_len, receiver_addr_len; // Lengths of the writer and receiver addresses.
     struct sockaddr_storage writer_addr, receiver_addr; // Structures for storing writer and receiver addresses.
     char data_buffer[BUFFER_SIZE], ack_buffer[BUFFER_SIZE]; // Buffers for data and acknowledgements.
@@ -131,8 +131,8 @@ static void initialize_fsm_instance(FSM *fsm, int argc, char *argv[], struct pol
     // Print out the parsed and handled arguments.
     printf("Receiver IP: %s\n", fsm->receiver_ip);
     printf("Receiver Port: %hu\n", fsm->receiver_port);
-    printf("Writer IP: %s\n", fsm->writer_ip);
-    printf("Writer Port: %hu\n", fsm->writer_port);
+    printf("Proxy IP: %s\n", fsm->proxy_ip);
+    printf("Proxy Port: %hu\n", fsm->proxy_port);
     printf("Drop Data Chance: %.2f%%\n", fsm->drop_data_chance);
     printf("Drop Ack Chance: %.2f%%\n", fsm->drop_ack_chance);
     printf("Delay Data Chance: %.2f%%\n", fsm->delay_data_chance);
@@ -140,7 +140,7 @@ static void initialize_fsm_instance(FSM *fsm, int argc, char *argv[], struct pol
 
     fsm->writer_sockfd = socket_create(fsm); // Create a socket for the writer and store the file descriptor.
     fsm->receiver_sockfd = socket_create(fsm); // Create a socket for the receiver and store the file descriptor.
-    socket_bind(fsm->writer_sockfd, fsm->writer_ip, fsm->writer_port); // Bind the writer's socket to its port.
+    socket_bind(fsm->writer_sockfd, fsm->proxy_ip, fsm->proxy_port); 
     ((struct sockaddr_in*)&fsm->receiver_addr)->sin_port = htons(fsm->receiver_port); // Set the receiver's port in the address structure.
 
     fds[0].fd = fsm->writer_sockfd; // Set the file descriptor for the writer's socket in the polling array.
@@ -230,10 +230,10 @@ static void parse_arguments(FSM *fsm) {
     printf("Parsing receiver port...\n");
     fsm->receiver_port = parse_in_port_t(fsm, fsm->argv[2]);
     printf("Receiver port parsed successfully.\n");
-    fsm->writer_ip = fsm->argv[3];
-    printf("Parsing writer port...\n");
-    fsm->writer_port = parse_in_port_t(fsm, fsm->argv[4]);
-    printf("Writer port parsed successfully.\n");
+    fsm->proxy_ip = fsm->argv[3];
+    printf("Parsing proxy port...\n");
+    fsm->proxy_port = parse_in_port_t(fsm, fsm->argv[4]);
+    printf("Proxy port parsed successfully.\n");
     fsm->drop_data_chance = atof(fsm->argv[5]);
     fsm->drop_ack_chance = atof(fsm->argv[6]);
     fsm->delay_data_chance = atof(fsm->argv[7]);
@@ -249,8 +249,8 @@ static void handle_arguments(FSM *fsm) {
         exit(EXIT_FAILURE);
     }
 
-    if (fsm->writer_ip == NULL) {
-        fprintf(stderr, "The writer IP address is required.\n");
+    if (fsm->proxy_ip == NULL) {
+        fprintf(stderr, "The proxy IP address is required.\n");
         exit(EXIT_FAILURE);
     }
 
@@ -261,8 +261,8 @@ static void handle_arguments(FSM *fsm) {
     }
 
     // Validate writer port
-    if (fsm->writer_port > UINT16_MAX || fsm->writer_port == 0) {
-        fprintf(stderr, "Invalid writer port: %hu\n", fsm->writer_port);
+    if (fsm->proxy_port > UINT16_MAX || fsm->proxy_port == 0) {
+        fprintf(stderr, "Invalid proxy port: %hu\n", fsm->proxy_port);
         exit(EXIT_FAILURE);
     }
     printf("Arguments checked.\n");
