@@ -175,7 +175,6 @@ func (fsm *WriterFSM) transmitting_state() WriterState {
 		go fsm.readStdin()
 		fsm.isStdInStarted = true
 	}
-
 	for {
 		select {
 			case <- fsm.EOFchan:
@@ -213,8 +212,6 @@ func (fsm *WriterFSM) retransmitting_state() WriterState {
 		}
 	}
 	return FatalError
-
-
 }
 
 
@@ -235,13 +232,10 @@ func (fsm *WriterFSM) recover_state() WriterState {
 }
 
 
-
-
 func (fsm *WriterFSM) fatal_error_state() WriterState {
 	fmt.Println("Fatal Error:", fsm.err)
 	return Termination
 }
-
 
 
 func (fsm *WriterFSM) close_connection_by_server_state() WriterState {
@@ -288,7 +282,6 @@ func (fsm *WriterFSM) close_connection_by_server_state() WriterState {
 			case <- time.After(fsm.timeoutDuration):
 				continue
 		}
-
 	}
 	return Exit
 }
@@ -362,7 +355,6 @@ func (fsm *WriterFSM) readStdin() {
 			packet := createPacket(fsm.ack, fsm.seq, FLAG_DATA, string(data))
 				fsm.inputChan <- packet
 				fsm.seq += uint32(len(data))
-
 		}
 	}
 }
@@ -381,14 +373,13 @@ func (fsm *WriterFSM) listenResponse(timout time.Duration) {
 			n, err := fsm.udpcon.Read(buffer)
 			if err != nil {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-
 					continue
-
 				} else {
 					fsm.errorChan <- err
 						return
 				}
 			}
+
 			if n > 0 {
 				if fsm.currentState == Transmitting || fsm.currentState == ReTransmitting {
 				if isValidPacket(buffer[:n], FLAG_ACK, fsm.seq) {
@@ -427,7 +418,7 @@ func (fsm *WriterFSM) sendPacket() {
 				fsm.errorChan <- err
 				return
 			}
-
+			
 			fsm.lastResponseMutex.Lock()
 			fsm.isLastPacketACKReceived = false
 			fsm.lastResponseMutex.Unlock()
@@ -438,6 +429,7 @@ func (fsm *WriterFSM) sendPacket() {
 				fsm.errorChan <- err
 				return
 			}
+
 			if fsm.currentState == Transmitting || fsm.currentState == ReTransmitting {
 			fsm.lastPacketMutex.Lock()
 			fsm.lastPacket = packet
