@@ -1,0 +1,17 @@
+# Resume Content
+
+### **Contact Information**
+
+- **Phone:** 236-971-2681
+- **Email:** [kyang72@my.bcit.ca](mailto:kyang72@my.bcit.ca)
+- **LinkedIn:** @ krypton-yang
+- **GitHub:** @ KYang72Bcit
+
+### **Skills**
+
+- **Programming Languages:** Proficient in Go, Java, Python, JavaScript, Kotlin.
+- **Web Development:** Experienced with React.js, Node.js, Django Framework, and HTML & CSS.
+- **Databases & APIs:** Knowledgeable in MySQL,****PostgreSQL**** and MongoDB.
+- **Cloud Services:** Competent with AWS  and Google Cloud Platform cloud technologies.
+- **Project Management:** Practiced in Agile methodology.
+- Others: Docker, Git, JUnit, Supertest

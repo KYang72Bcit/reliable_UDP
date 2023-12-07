@@ -367,7 +367,7 @@ func (fsm *WriterFSM) listenResponse(timout time.Duration) {
 			}
 
 			if n > 0 {
-				if fsm.currentState == Transmitting || fsm.currentState == ReTransmitting {
+				if fsm.currentState == Transmitting {
 					if isValidPacket(buffer[:n], FLAG_ACK, fsm.lastPacket.Header.SeqNum + fsm.lastPacket.Header.DataLen) {
 						fsm.lastResponseMutex.Lock()
 						fsm.isLastPacketACKReceived = true
@@ -388,46 +388,13 @@ func (fsm *WriterFSM) listenResponse(timout time.Duration) {
 }
 
 
-func (fsm *WriterFSM)sendPacket(rawPacket CustomPacket) {
-			packet, err := json.Marshal(rawPacket)
-			if err != nil {
-				fsm.errorChan <- err
-				return 
-			}
-			fsm.lastResponseMutex.Lock()
-			fsm.isLastPacketACKReceived = false
-			fsm.lastResponseMutex.Unlock()
 
-			_, err = fsm.udpcon.Write(packet)
-			//fmt.Println("packet sent: ", string(packet))
-			if err != nil {
-				fsm.errorChan <- err
-				return 
-			}
-			fsm.lastPacketMutex.Lock()
-			fsm.lastPacket = rawPacket
-			fsm.lastPacketMutex.Unlock()
 
-			go func() {
-				time.Sleep(fsm.timeoutDuration)
-
-				fsm.lastPacketMutex.Lock()
-				if !fsm.isLastPacketACKReceived {
-					fsm.reTransmitChan <- struct{}{}
-				}
-				fsm.lastPacketMutex.Unlock()
-			}()
-
-}
-
-func (fsm *WriterFSM) sendPacket_1() {
+func (fsm *WriterFSM) sendPacket() {
 	defer fmt.Println("closing send packet")
 	defer fsm.wg.Done()
 	for {
-	select {
-		case <- fsm.stopChan:
-			return
-		default:
+	
 			rawPacket := fsm.packetQueue.PopFront()
 			packet, err := json.Marshal(rawPacket)
 			if err != nil {
@@ -439,28 +406,26 @@ func (fsm *WriterFSM) sendPacket_1() {
 			fsm.lastResponseMutex.Unlock()
 
 			_, err = fsm.udpcon.Write(packet)
-			//fmt.Println("packet sent: ", string(packet))
 			if err != nil {
 				fsm.errorChan <- err
 				return
 			}
 
-			if fsm.currentState == Transmitting || fsm.currentState == ReTransmitting {
+			if fsm.currentState == Transmitting{
 			fsm.lastPacketMutex.Lock()
 			fsm.lastPacket = rawPacket
 			fsm.lastPacketMutex.Unlock()
+		
+			time.Sleep(fsm.timeoutDuration)
 
-			go func() {
-				time.Sleep(fsm.timeoutDuration)
-
-				fsm.lastPacketMutex.Lock()
-				if !fsm.isLastPacketACKReceived {
-					fsm.reTransmitChan <- struct{}{}
-				}
-				fsm.lastPacketMutex.Unlock()
-			}()
-		}
-	}
+			fsm.lastPacketMutex.Lock()
+			if !fsm.isLastPacketACKReceived {
+				fsm.packetQueue.PushFront(fsm.lastPacket)
+			}
+			fsm.lastPacketMutex.Unlock()
+			
+		
+	 }
 
 
 	}
