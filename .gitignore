@@ -24,4 +24,6 @@ sample/
 echo/
 /writer/writer
 /receiver/receiver
+# csv files
+*.csv
 ```
