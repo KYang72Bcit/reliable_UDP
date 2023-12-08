@@ -2,22 +2,23 @@ package main
 
 import (
 	"bufio"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 	"os"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 )
 
 const (
 	args = 3
-	maxRetries = 10
-	maxDataLength = 128
-	packetBufferSize = 2
+	maxRetries = 20
+	maxDataLength = 512
+	packetTTL = 20
+	portLimit = 65535
 )
 
 /**
@@ -34,6 +35,8 @@ const (
 	FLAG_DATA
 )
 
+var statistics []Statistics = make([]Statistics, 0)
+
 //////////////////define custom packet structure//////////////////////
 type CustomPacket struct {
 	Header Header  `json:"header"`
@@ -45,8 +48,18 @@ type Header struct {
 	SeqNum uint32 `json:"seqNum"`
 	AckNum uint32  `json:"ackNum"`
 	DataLen uint32 `json:"dataLen"`
+	TTL     int     `json:"ttl"` // how many times this packet has been sent
 	Flags byte     `json:"flags"`
 }
+
+type Statistics struct {
+	TimeStamp string
+	PacketSent int
+	PacketReceived int
+	PacketAcked int
+}
+
+
 
 /////////////////////////define writer FSM///////////////////////////
 type WriterState int
@@ -55,26 +68,26 @@ type WriterFSM struct {
 	currentState WriterState
 	ip net.IP
 	port int
-	maxRetries int
 	udpcon *net.UDPConn
 	stdinReader *bufio.Reader
 	EOFchan chan struct{} //channel for EOF signal handling
 	responseChan chan []byte //channel for response handling
-	inputChan chan CustomPacket //channel for input handling
 	errorChan chan error //channel for error handling between go routines
-	stopChan chan struct{} //channel for notifying go routines to stop
-	serverCloseChan chan struct{} //channel for server close handling
+	stopSendPacketChan chan struct{} //channel for notifying go routines to stop
 	stopListenResponseChan chan struct{} //channel for notifying transmission
 	ack uint32
 	seq uint32
-	data string
 	timeoutDuration time.Duration
+	//timer *time.Timer
 	mutex sync.Mutex
 	lastPacket CustomPacket
 	wg sync.WaitGroup
 	isStdInStarted bool
 	isLastPacketACKReceived bool
 	packetQueue *DQueue
+	packetSent int
+	packetReceived int
+	packetAcked int
 }
 
 const (
@@ -85,7 +98,6 @@ const (
 	Recover
 	ErrorHandling
 	FatalError
-	CloseConnectionByServer
 	Termination
 	Exit
 )
@@ -94,23 +106,21 @@ const (
 func NewWriterFSM() *WriterFSM {
 	return &WriterFSM{
 		currentState: Init,
-		maxRetries: maxRetries,
 		stdinReader: bufio.NewReader(os.Stdin),
 		responseChan: make(chan []byte),
-		inputChan: make(chan CustomPacket, packetBufferSize),
-		errorChan: make(chan error),
+		errorChan: make(chan error, 1),
 		EOFchan: make(chan struct{}),
-		stopChan: make(chan struct{}),
+		stopSendPacketChan: make(chan struct{}),
 		stopListenResponseChan: make(chan struct{}),
 		ack: 0,
 		seq: 0,
-		data: "",
-		serverCloseChan: make(chan struct{}),
 		lastPacket: CustomPacket{},
 		timeoutDuration: 2 * time.Second,
 		isStdInStarted: false,
 		packetQueue: NewDQueue(),
-
+		packetSent: 0,
+		packetReceived: 0,
+		packetAcked: 0,
 	}
 }
 
@@ -121,10 +131,12 @@ func (fsm *WriterFSM) init_State() WriterState {
 		fsm.err = errors.New("invalid number of arguments, <ip> <port>")
 		return FatalError
 	}
+
 	fsm.ip, fsm.err = validateIP(os.Args[1])
 	if fsm.err != nil {
 		return FatalError
 	}
+
 	fsm.port, fsm.err = validatePort(os.Args[2])
 	if fsm.err != nil {
 		return FatalError
@@ -145,10 +157,10 @@ func (fsm *WriterFSM) create_socket_state() WriterState {
 func (fsm *WriterFSM) syncronize_server_state() WriterState {
 	fmt.Println("Syncronizing server")
 	fsm.wg.Add(2)
-
+	go fsm.recordStatistics()
 	go fsm.listenResponse(fsm.timeoutDuration)
 	go fsm.sendPacket()
-	for {
+	for i := 0; i < maxRetries; i++ {
 		packet := createPacket(fsm.ack, fsm.seq, FLAG_SYN, "")
 		fsm.packetQueue.PushBack(packet)
 		select {
@@ -156,6 +168,7 @@ func (fsm *WriterFSM) syncronize_server_state() WriterState {
 				return FatalError
 			case responsePacket := <- fsm.responseChan:
 				if isValidPacket(responsePacket, FLAG_ACK, fsm.seq){
+					fsm.packetAcked++
 					return Transmitting
 				} else {
 					continue
@@ -165,6 +178,8 @@ func (fsm *WriterFSM) syncronize_server_state() WriterState {
 				continue
 		}
 	}
+	fsm.err = errors.New("max retries to connect server exceeded")
+	return FatalError
 
 }
 
@@ -180,8 +195,6 @@ func (fsm *WriterFSM) transmitting_state() WriterState {
 		select {
 			case <- fsm.EOFchan:
 				return Termination
-			case <-fsm.serverCloseChan:
-				return CloseConnectionByServer
 			case fsm.err = <- fsm.errorChan:
 				return ErrorHandling
 
@@ -192,7 +205,7 @@ func (fsm *WriterFSM) transmitting_state() WriterState {
 
 func (fsm *WriterFSM) error_handling_state() WriterState {
 	fmt.Println("Error:", fsm.err)
-	fsm.stopChan <- struct{}{}
+	fsm.stopSendPacketChan <- struct{}{}
 	fsm.wg.Wait()
 	return Recover
 }
@@ -210,64 +223,32 @@ func (fsm *WriterFSM) fatal_error_state() WriterState {
 }
 
 
-func (fsm *WriterFSM) close_connection_by_server_state() WriterState {
-	defer fsm.udpcon.Close()
-	fmt.Println("Closing connection by server")
-	fsm.stopChan <- struct{}{}
-	fsm.wg.Wait()
-	fmt.Println("all goroutines closed")
-	fsm.wg.Add(1)
-	go fsm.listenResponse(5000*time.Millisecond)
 
-	for  i := 0; i < maxRetries; i++ {
-		packet, _ := json.Marshal(createPacket(fsm.ack, fsm.seq, FLAG_FIN|FLAG_ACK, ""))
-		_, err := fsm.udpcon.Write(packet)
-		if err != nil {
-
-			return Exit
-		}
-		select {
-			case response := <- fsm.responseChan:
-				if isValidPacket(response, FLAG_FIN|FLAG_ACK, fsm.seq) {
-					break
-
-				}
-			case <- time.After(fsm.timeoutDuration):
-				continue
-
-		}
-	}
-
-	for  i := 0; i < maxRetries; i++ {
-		packet, _ := json.Marshal(createPacket(fsm.ack, fsm.seq, FLAG_FIN, ""))
-		_, err := fsm.udpcon.Write(packet)
-		if err != nil {
-
-			return Exit
-		}
-		select {
-			case response := <- fsm.responseChan:
-				if isValidPacket(response, FLAG_FIN, fsm.seq) {
-					return Exit
-
-				}
-			case <- time.After(fsm.timeoutDuration):
-				continue
-		}
-	}
-	return Exit
-}
-
-func (fsm *WriterFSM)terminate_state() WriterState {
-	fsm.stopChan <- struct{}{}
+func (fsm *WriterFSM) terminate_state() WriterState {
+	fsm.stopSendPacketChan <- struct{}{}
 	fmt.Println("closing go routines")
-	fsm.wg.Wait()
-	fmt.Println("all goroutines closed")
-	if fsm.udpcon != nil {
-	fsm.udpcon.Close()
+
+
+	done := make(chan struct{})
+	go func() {
+		fsm.wg.Wait()
+		close(done)
+	}()
+
+	for {
+		select {
+		case <-done:
+			fmt.Println("all goroutines closed")
+			if fsm.udpcon != nil {
+				fsm.udpcon.Close()
+			}
+			return Exit
+		case err := <-fsm.errorChan:
+			fmt.Println("Error:", err)
+		}
 	}
-	return Exit
 }
+
 
 func (fsm *WriterFSM) exit_state() {
 	fmt.Println("Client Exiting...")
@@ -288,8 +269,6 @@ func (fsm *WriterFSM) Run() {
 				fsm.currentState = fsm.transmitting_state()
 			case ErrorHandling:
 				fsm.currentState = fsm.error_handling_state()
-			case CloseConnectionByServer:
-				fsm.currentState = fsm.close_connection_by_server_state()
 			case Recover:
 				fsm.currentState = fsm.recover_state()
 			case FatalError:
@@ -321,7 +300,6 @@ func (fsm *WriterFSM) readStdin() {
 		}
 		if n > 0 {
 			data := string(inputBuffer[:n])
-			data = strings.Trim(data, "\n")
 			packet := createPacket(fsm.ack, fsm.seq, FLAG_DATA, string(data))
 			fsm.packetQueue.PushBack(packet)
 				fsm.seq += uint32(len(data))
@@ -349,15 +327,14 @@ func (fsm *WriterFSM) listenResponse(timout time.Duration) {
 				}
 			}
 			if n > 0 {
+				fsm.packetReceived++
 				if fsm.currentState != SyncronizeServer {
 					if isValidPacket(buffer[:n], FLAG_ACK, fsm.lastPacket.Header.SeqNum + fsm.lastPacket.Header.DataLen) {
 						fsm.mutex.Lock()
 						fsm.isLastPacketACKReceived = true
+						fsm.packetAcked++
 						fsm.mutex.Unlock()
 					}
-				if isFINPacket(buffer[:n]) {
-					fsm.serverCloseChan <- struct{}{}
-				}
 
 			} else {
 				fsm.responseChan <- buffer[:n]
@@ -376,22 +353,28 @@ func (fsm *WriterFSM) sendPacket() {
 
 	for {
 		select {
-			case <- fsm.stopChan:
+			case <- fsm.stopSendPacketChan:
 				if !shouldStop {
 					shouldStop = true
 					fmt.Println("Receive EOF from keyboard")
 				}
 
 			default:
-
 				if fsm.packetQueue.Len() > 0 {
 					rawPacket := fsm.packetQueue.PopFront()
+					if rawPacket.Header.TTL < 0 {
+
+						fsm.errorChan <- errors.New("max retries to send packet exceeded")
+						fsm.stopListenResponseChan <- struct{}{}
+						return
+					}
 					packet, _ := json.Marshal(rawPacket)
 					_, err := fsm.udpcon.Write(packet)
 					if err != nil {
 						fsm.errorChan <- err
 						return
 					}
+					fsm.packetSent++
 					if fsm.currentState != SyncronizeServer {
 						fsm.mutex.Lock()
 						fsm.isLastPacketACKReceived = false
@@ -400,23 +383,44 @@ func (fsm *WriterFSM) sendPacket() {
 						time.Sleep(fsm.timeoutDuration)
 						fsm.mutex.Lock()
 						if !fsm.isLastPacketACKReceived {
+							rawPacket.Header.TTL--
 							fsm.packetQueue.PushFront(rawPacket)
 						}
 						fsm.mutex.Unlock()
 					}
 
 				}  else if shouldStop {
-					fmt.Println("stop sending packet")
 					fsm.stopListenResponseChan <- struct{}{}
 					return
 
 				} else  {
 					time.Sleep(100*time.Millisecond)
 				}
-
 		}
 
 		}
+	}
+
+	func (fsm *WriterFSM) recordStatistics() {
+		start := time.Now()
+		for {
+			time.Sleep(10 * time.Second)
+			elapsed := int(time.Since(start).Seconds())
+			elapsedTimestamp := time.Date(0, 1, 1, 0, 0, elapsed, 0, time.UTC)
+			formattedTimestamp := elapsedTimestamp.Format("04:05")
+
+
+			statistic := Statistics{
+				TimeStamp: formattedTimestamp,
+				PacketSent: fsm.packetSent,
+				PacketReceived: fsm.packetReceived,
+				PacketAcked: fsm.packetAcked,
+			}
+
+			statistics = append(statistics, statistic)
+
+		}
+
 	}
 
 
@@ -432,7 +436,7 @@ func validateIP(ip string) (net.IP, error){
 
 func validatePort(port string) (int, error) {
 	portNo, err := strconv.Atoi(port)
-	if err != nil || portNo < 0 || portNo > 65535 {
+	if err != nil || portNo < 0 || portNo > portLimit {
 		return -1, errors.New("invalid port number")
 	}
 	return portNo, nil
@@ -445,6 +449,7 @@ func createPacket(ack uint32, seq uint32, flags byte, data string) CustomPacket 
 			AckNum: ack,
 			DataLen: uint32(len(data)),
 			Flags: flags,
+			TTL: packetTTL,
 		},
 		Data: data,
 
@@ -452,6 +457,7 @@ func createPacket(ack uint32, seq uint32, flags byte, data string) CustomPacket 
 	return packet
 
 }
+
 
 func isValidPacket(response []byte, flags byte, seq uint32) bool {
 	header,  err := parsePacket(response)
@@ -461,13 +467,6 @@ func isValidPacket(response []byte, flags byte, seq uint32) bool {
 	return header.Flags == flags && header.AckNum == seq
 }
 
-func isFINPacket(response []byte) bool {
-	header,  err := parsePacket(response)
-	if err != nil {
-		return false
-	}
-	return header.Flags == FLAG_FIN
-}
 
 func parsePacket(response []byte) (*Header,  error) {
 	var packet CustomPacket
@@ -478,11 +477,47 @@ func parsePacket(response []byte) (*Header,  error) {
 	return &packet.Header, nil
 }
 
+func exportToCSV(statistics []Statistics) error {
+	file, err := os.Create("writer_performance.csv")
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	writer := csv.NewWriter(file)
+	defer writer.Flush()
+
+	writer.Write([]string{"Time Elapsed", "Packets Sent", "Packets Received", "Packets Acked", "Acked Rate"})
+
+	for _, stat := range statistics {
+		var percentage string
+		if stat.PacketReceived == 0 {
+			percentage = "N/A"
+
+		} else {
+			percentage = strconv.FormatFloat(float64(stat.PacketAcked)/float64(stat.PacketReceived)*100, 'f', 2, 64)+ "%"
+		}
+		record := []string{
+			stat.TimeStamp,
+			strconv.Itoa(stat.PacketSent),
+			strconv.Itoa(stat.PacketReceived),
+			strconv.Itoa(stat.PacketAcked),
+			percentage,
+		}
+		writer.Write(record)
+	}
+
+	return nil
+}
+
+
+
 /////////////////////////////main function//////////////////////////////////////
 
 func main() {
 	writerFSM := NewWriterFSM()
 	writerFSM.Run()
+	exportToCSV(statistics)
 }
 
 ///////////////////thread safe dqueue/////////////

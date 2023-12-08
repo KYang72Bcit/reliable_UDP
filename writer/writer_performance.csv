@@ -1,0 +1,6 @@
+Time Elapsed,Packets Sent,Packets Received,Packets Acked,Acked Rate
+00:10,6,3,3,50.00%
+00:20,11,5,5,45.45%
+00:30,16,6,6,37.50%
+00:40,21,6,6,28.57%
+00:50,26,7,7,26.92%

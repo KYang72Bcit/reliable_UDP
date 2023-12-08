@@ -1,17 +1,50 @@
-# Resume Content
+Contact Information
+Phone: 236-971-2681
+Email: kyang72@my.bcit.ca
+LinkedIn: @ krypton-yang
+GitHub: @ KYang72Bcit
+Skills
+Programming Languages: Proficient in Go, Java, Python, JavaScript, Kotlin.
+Web Development: Experienced with React.js, Node.js, Django Framework, HTML & CSS.
+Testing & Version Control: Skilled in using Git.
+Databases & APIs: Knowledgeable in MySQL and MongoDB.
+Cloud Services: Competent with AWS cloud technologies.
+Others: Docker, Git, JUnit, Supertest,
+Work Experience
+Cloud Developer, YVR Water Monitoring Station (Jan 2023 - May 2023)
+Optimized AWS cloud architecture, designing and configuring a relational database to manage and calibrate sensor and IoT device data.
+Strengthened security protocols for AWS Lambda access by establishing VPC endpoints and integrating AWS Secrets Manager for secure credential handling.
+Coop Software Developer, Haylar Technologies Inc. (May 2022 - Aug 2022)
+Collaborated directly with the company founder and clients to develop a customized educational forum, leveraging the open-source platform Discourse.
+Orchestrated the deployment of the application in Docker containers, which bolstered the performance and reliability of the platform.
+Crafted dynamic user interfaces with Ember.js and engineered Ruby on Rails plugins to allow seamless integration with the LinkedIn API.
+Founder, KQ HandMade Jewelry Shop (Aug 2013 - Feb 2020)
+Operated a successful online jewelry shop, showcasing handmade items.
+Achieved over 7,000 sales, generating CA$1.9 million in revenue and CA$600,000 in net profit.
+Built a strong online presence with 9,000 followers on Taobao Marketplace.
+Projects
+RentRight: Android Application for Rental Listings (Sep 2023 - Present)
+Developed 'RentRight', an Android application designed for tenants to find rental listings and landlords to post properties.
+Executed a CICD pipeline using GitHub Actions for seamless integration and delivery.
+Employed Kotlin for app development, MongoDB for data management, and Node.js for backend functionality.
+Technical Skills: Kotlin, MongoDB, Node.js
+Reliable UDP Protocol  (Nov  2023 - Present )
+Engineered a robust command-line chat application utilizing the UDP protocol, enhancing reliability akin to TCP by crafting packets that mitigate loss and transmission errors.
+Designed an intuitive GUI for real-time analytics of packet delivery metrics, including arrival percentages and transmission rates.
+Tech Stack: Golang, Python 
+KQHandMade: E-commerce Web Application (Dec 2021 - Jan 2022)
+Developed a full-stack e-commerce website independently, using Vue.js for front-end and Python Django REST Framework for back-end.
+Deployed the project on DigitalOcean, utilizing a suite of technologies like Certbot, NGINX, Gunicorn, PostgreSQL.
+Implemented RESTful APIs for product retrieval, checkout, and user authentication; integrated Stripe API for secure payments.
+Technical Skills: Django REST Framework, RESTful APIs, Vue.js.
+Education
+BSc Applied Computer Science - Network Security Applications Development
+Institution: British Columbia Institute of Technology
+Graduation: Class of 2025
+Computer Systems Technology Diploma
+Institution: British Columbia Institute of Technology
+Graduation: Class of 2023
+MSc Management in Contemporary China and Emerging Markets
+Institution: University of Nottingham
+Graduation: Class of 2012
 
-### **Contact Information**
-
-- **Phone:** 236-971-2681
-- **Email:** [kyang72@my.bcit.ca](mailto:kyang72@my.bcit.ca)
-- **LinkedIn:** @ krypton-yang
-- **GitHub:** @ KYang72Bcit
-
-### **Skills**
-
-- **Programming Languages:** Proficient in Go, Java, Python, JavaScript, Kotlin.
-- **Web Development:** Experienced with React.js, Node.js, Django Framework, and HTML & CSS.
-- **Databases & APIs:** Knowledgeable in MySQL,****PostgreSQL**** and MongoDB.
-- **Cloud Services:** Competent with AWS  and Google Cloud Platform cloud technologies.
-- **Project Management:** Practiced in Agile methodology.
-- Others: Docker, Git, JUnit, Supertest
