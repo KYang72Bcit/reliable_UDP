@@ -64,14 +64,14 @@ type WriterFSM struct {
 	errorChan chan error //channel for error handling between go routines
 	stopChan chan struct{} //channel for notifying go routines to stop
 	serverCloseChan chan struct{} //channel for server close handling
-	transmitChan chan struct{} //channel for notifying transmission
-	reTransmitChan chan struct{} //channel for notifying retransmission
+	stopListenResponseChan chan struct{} //channel for notifying transmission
+
 	ack uint32
 	seq uint32
 	data string
 	timeoutDuration time.Duration
-	lastPacketMutex sync.Mutex
-	lastResponseMutex sync.Mutex
+	mutex sync.Mutex
+
 	lastPacket CustomPacket
 	wg sync.WaitGroup
 	isStdInStarted bool
@@ -104,8 +104,7 @@ func NewWriterFSM() *WriterFSM {
 		errorChan: make(chan error),
 		EOFchan: make(chan struct{}),
 		stopChan: make(chan struct{}),
-		transmitChan: make(chan struct{}),
-		reTransmitChan: make(chan struct{}),
+		stopListenResponseChan: make(chan struct{}),
 		ack: 0,
 		seq: 0,
 		data: "",
@@ -151,7 +150,7 @@ func (fsm *WriterFSM) syncronize_server_state() WriterState {
 	fsm.wg.Add(2)
 
 	go fsm.listenResponse(fsm.timeoutDuration)
-	//go fsm.sendPacket()
+	go fsm.sendPacket()
 	for {
 		packet := createPacket(fsm.ack, fsm.seq, FLAG_SYN, "")
 		fsm.packetQueue.PushBack(packet)
@@ -188,18 +187,9 @@ func (fsm *WriterFSM) transmitting_state() WriterState {
 				return CloseConnectionByServer
 			case fsm.err = <- fsm.errorChan:
 				return ErrorHandling
-			case <-fsm.reTransmitChan:
-				return ReTransmitting
-			case <-fsm.transmitChan:
-				continue
 
 		}
 	}
-}
-
-func (fsm *WriterFSM) retransmitting_state() WriterState {
-	fsm.packetQueue.PushFront(fsm.lastPacket)
-	return Transmitting
 }
 
 
@@ -300,8 +290,6 @@ func (fsm *WriterFSM) Run() {
 				fsm.currentState = fsm.syncronize_server_state()
 			case Transmitting:
 				fsm.currentState = fsm.transmitting_state()
-			case ReTransmitting:
-				fsm.currentState = fsm.retransmitting_state()
 			case ErrorHandling:
 				fsm.currentState = fsm.error_handling_state()
 			case CloseConnectionByServer:
@@ -351,7 +339,7 @@ func (fsm *WriterFSM) listenResponse(timout time.Duration) {
 	defer fsm.wg.Done()
 	for {
 		select {
-		case <-fsm.stopChan:
+		case <-fsm.stopListenResponseChan:
 			return
 		default:
 			fsm.udpcon.SetReadDeadline(time.Now().Add(500*time.Millisecond))
@@ -369,10 +357,9 @@ func (fsm *WriterFSM) listenResponse(timout time.Duration) {
 			if n > 0 {
 				if fsm.currentState == Transmitting {
 					if isValidPacket(buffer[:n], FLAG_ACK, fsm.lastPacket.Header.SeqNum + fsm.lastPacket.Header.DataLen) {
-						fsm.lastResponseMutex.Lock()
+						fsm.mutex.Lock()
 						fsm.isLastPacketACKReceived = true
-						fsm.lastResponseMutex.Unlock()
-						fsm.transmitChan <- struct{}{}
+						fsm.mutex.Unlock()
 					}
 				if isFINPacket(buffer[:n]) {
 					fsm.serverCloseChan <- struct{}{}
@@ -389,44 +376,57 @@ func (fsm *WriterFSM) listenResponse(timout time.Duration) {
 
 
 
+// if there is packet in queue -> pop the frist packet and send
 
 func (fsm *WriterFSM) sendPacket() {
 	defer fmt.Println("closing send packet")
 	defer fsm.wg.Done()
+	shouldStop := false
+
 	for {
-	
-			rawPacket := fsm.packetQueue.PopFront()
-			packet, err := json.Marshal(rawPacket)
-			if err != nil {
-				fsm.errorChan <- err
-				return
-			}
-			fsm.lastResponseMutex.Lock()
-			fsm.isLastPacketACKReceived = false
-			fsm.lastResponseMutex.Unlock()
+		if fsm.packetQueue.Len() == 0 && shouldStop {
+			fmt.Println("stop sending packet")
+			fsm.stopListenResponseChan <- struct{}{}
+			break
+		 }
 
-			_, err = fsm.udpcon.Write(packet)
-			if err != nil {
-				fsm.errorChan <- err
-				return
-			}
+		select {
+			case <- fsm.stopChan:
 
-			if fsm.currentState == Transmitting{
-			fsm.lastPacketMutex.Lock()
-			fsm.lastPacket = rawPacket
-			fsm.lastPacketMutex.Unlock()
-		
-			time.Sleep(fsm.timeoutDuration)
+				if !shouldStop {
+					shouldStop = true
+					fmt.Println("Receive EOF from keyboard")
+					//fsm.stopListenResponseChan <- struct{}{}
+				}
+				//shouldStop = true
 
-			fsm.lastPacketMutex.Lock()
-			if !fsm.isLastPacketACKReceived {
-				fsm.packetQueue.PushFront(fsm.lastPacket)
-			}
-			fsm.lastPacketMutex.Unlock()
-			
-		
-	 }
+			default:
+				if fsm.packetQueue.Len() > 0 {
+					rawPacket := fsm.packetQueue.PopFront()
+					packet, _ := json.Marshal(rawPacket)
+					_, err := fsm.udpcon.Write(packet)
+					if err != nil {
+						fsm.errorChan <- err
+						return
+					}
+					if fsm.currentState == Transmitting {
+						fsm.mutex.Lock()
+						fsm.isLastPacketACKReceived = false
+						fsm.lastPacket = rawPacket
+						fsm.mutex.Unlock()
+						time.Sleep(fsm.timeoutDuration)
+						fsm.mutex.Lock()
+						if !fsm.isLastPacketACKReceived {
+							fsm.packetQueue.PushFront(rawPacket)
+						}
+						fsm.mutex.Unlock()
+					}
 
+				} else {
+					time.Sleep(100*time.Millisecond)
+				}
+
+		}
 
 	}
 }
