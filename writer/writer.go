@@ -16,7 +16,7 @@ import (
 const (
 	args = 3
 	maxRetries = 10
-	bufferSize = 1024 * 64
+	maxDataLength = 128
 	packetBufferSize = 2
 )
 
@@ -65,13 +65,11 @@ type WriterFSM struct {
 	stopChan chan struct{} //channel for notifying go routines to stop
 	serverCloseChan chan struct{} //channel for server close handling
 	stopListenResponseChan chan struct{} //channel for notifying transmission
-
 	ack uint32
 	seq uint32
 	data string
 	timeoutDuration time.Duration
 	mutex sync.Mutex
-
 	lastPacket CustomPacket
 	wg sync.WaitGroup
 	isStdInStarted bool
@@ -84,7 +82,6 @@ const (
 	CreateSocket
 	SyncronizeServer
 	Transmitting
-	ReTransmitting
 	Recover
 	ErrorHandling
 	FatalError
@@ -174,11 +171,11 @@ func (fsm *WriterFSM) syncronize_server_state() WriterState {
 /////////////////////////////////////////////Transmitting State////////////////////////////////////////
 
 func (fsm *WriterFSM) transmitting_state() WriterState {
-	//fmt.Println("Transmitting")
 	if !fsm.isStdInStarted {
 		go fsm.readStdin()
 		fsm.isStdInStarted = true
 	}
+
 	for {
 		select {
 			case <- fsm.EOFchan:
@@ -195,14 +192,13 @@ func (fsm *WriterFSM) transmitting_state() WriterState {
 
 func (fsm *WriterFSM) error_handling_state() WriterState {
 	fmt.Println("Error:", fsm.err)
-	close(fsm.stopChan) //notify all goroutines to stop
+	fsm.stopChan <- struct{}{}
 	fsm.wg.Wait()
 	return Recover
 }
 
 
 func (fsm *WriterFSM) recover_state() WriterState {
-	fsm.stopChan = make(chan struct{})
 	fmt.Println("Recovering")
 	return SyncronizeServer
 }
@@ -217,7 +213,7 @@ func (fsm *WriterFSM) fatal_error_state() WriterState {
 func (fsm *WriterFSM) close_connection_by_server_state() WriterState {
 	defer fsm.udpcon.Close()
 	fmt.Println("Closing connection by server")
-	close(fsm.stopChan)
+	fsm.stopChan <- struct{}{}
 	fsm.wg.Wait()
 	fmt.Println("all goroutines closed")
 	fsm.wg.Add(1)
@@ -263,7 +259,7 @@ func (fsm *WriterFSM) close_connection_by_server_state() WriterState {
 }
 
 func (fsm *WriterFSM)terminate_state() WriterState {
-	close(fsm.stopChan)
+	fsm.stopChan <- struct{}{}
 	fmt.Println("closing go routines")
 	fsm.wg.Wait()
 	fmt.Println("all goroutines closed")
@@ -313,7 +309,7 @@ func (fsm *WriterFSM) Run() {
 func (fsm *WriterFSM) readStdin() {
 	fmt.Println("reading stdin, press ctrl + D to exit")
 	for {
-		inputBuffer := make([]byte, bufferSize)
+		inputBuffer := make([]byte, maxDataLength)
 		n, err := fsm.stdinReader.Read(inputBuffer)
 		if err != nil {
 			if err.Error() == "EOF" {
@@ -333,9 +329,8 @@ func (fsm *WriterFSM) readStdin() {
 	}
 }
 
-
 func (fsm *WriterFSM) listenResponse(timout time.Duration) {
-	defer fmt.Println("closing listen response")
+	defer fmt.Println("listening to response closed")
 	defer fsm.wg.Done()
 	for {
 		select {
@@ -343,7 +338,7 @@ func (fsm *WriterFSM) listenResponse(timout time.Duration) {
 			return
 		default:
 			fsm.udpcon.SetReadDeadline(time.Now().Add(500*time.Millisecond))
-			buffer := make([]byte, bufferSize)
+			buffer := make([]byte, maxDataLength)
 			n, err := fsm.udpcon.Read(buffer)
 			if err != nil {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
@@ -353,9 +348,8 @@ func (fsm *WriterFSM) listenResponse(timout time.Duration) {
 						return
 				}
 			}
-
 			if n > 0 {
-				if fsm.currentState == Transmitting {
+				if fsm.currentState != SyncronizeServer {
 					if isValidPacket(buffer[:n], FLAG_ACK, fsm.lastPacket.Header.SeqNum + fsm.lastPacket.Header.DataLen) {
 						fsm.mutex.Lock()
 						fsm.isLastPacketACKReceived = true
@@ -375,32 +369,21 @@ func (fsm *WriterFSM) listenResponse(timout time.Duration) {
 }
 
 
-
-// if there is packet in queue -> pop the frist packet and send
-
 func (fsm *WriterFSM) sendPacket() {
-	defer fmt.Println("closing send packet")
+	defer fmt.Println("sending packet closed")
 	defer fsm.wg.Done()
 	shouldStop := false
 
 	for {
-		if fsm.packetQueue.Len() == 0 && shouldStop {
-			fmt.Println("stop sending packet")
-			fsm.stopListenResponseChan <- struct{}{}
-			break
-		 }
-
 		select {
 			case <- fsm.stopChan:
-
 				if !shouldStop {
 					shouldStop = true
 					fmt.Println("Receive EOF from keyboard")
-					//fsm.stopListenResponseChan <- struct{}{}
 				}
-				//shouldStop = true
 
 			default:
+
 				if fsm.packetQueue.Len() > 0 {
 					rawPacket := fsm.packetQueue.PopFront()
 					packet, _ := json.Marshal(rawPacket)
@@ -409,7 +392,7 @@ func (fsm *WriterFSM) sendPacket() {
 						fsm.errorChan <- err
 						return
 					}
-					if fsm.currentState == Transmitting {
+					if fsm.currentState != SyncronizeServer {
 						fsm.mutex.Lock()
 						fsm.isLastPacketACKReceived = false
 						fsm.lastPacket = rawPacket
@@ -422,18 +405,19 @@ func (fsm *WriterFSM) sendPacket() {
 						fsm.mutex.Unlock()
 					}
 
-				} else {
+				}  else if shouldStop {
+					fmt.Println("stop sending packet")
+					fsm.stopListenResponseChan <- struct{}{}
+					return
+
+				} else  {
 					time.Sleep(100*time.Millisecond)
 				}
 
 		}
 
+		}
 	}
-}
-
-
-
-
 
 
 
@@ -474,14 +458,7 @@ func isValidPacket(response []byte, flags byte, seq uint32) bool {
 	if err != nil {
 		return false
 	}
-	if header.Flags == FLAG_ACK  && header.AckNum == seq {
-
-		ackNo := fmt.Sprint(header.AckNum)
-		fmt.Println("received ack: ", ackNo)
-		return true
-	}
-	//return header.Flags == flags && header.AckNum == seq
-	return false
+	return header.Flags == flags && header.AckNum == seq
 }
 
 func isFINPacket(response []byte) bool {
@@ -551,7 +528,6 @@ func (q *DQueue) PopFront() CustomPacket {
 	q.len--
 	return packet
 }
-
 
 func (q *DQueue) Len() int {
 	q.mutex.Lock()

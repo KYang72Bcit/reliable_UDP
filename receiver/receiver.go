@@ -306,7 +306,7 @@ func (fsm *ReceiverFSM) printToConsole() {
 			case <- fsm.stopChan:
 				return
 			case packet := <- fsm.outputChan:
-				fmt.Println(packet.Data)
+				fmt.Print(packet.Data)
 		}
 	}
 }
@@ -341,8 +341,8 @@ func validatePort(port string) (int, error) {
 }
 
 func isValidPacket(header *Header , ackNum uint32, seqNum uint32) bool {
-	fmt.Println("expected seqNum: ", fmt.Sprint(ackNum))
-	fmt.Println("actual seqNum: ", fmt.Sprint(header.SeqNum))
+	//fmt.Println("expected seqNum: ", fmt.Sprint(ackNum))
+	//fmt.Println("actual seqNum: ", fmt.Sprint(header.SeqNum))
 	return header.SeqNum == ackNum
 
 }
@@ -359,7 +359,7 @@ func isFINACKPacket(header *Header) bool {
 
 func parsePacket(response []byte) (*CustomPacket, *Header, error) {
 	var packet CustomPacket
-	fmt.Println("Receive Packet" + string(response))
+	//fmt.Println("Receive Packet" + string(response))
 	err := json.Unmarshal(response, &packet)
 	if err != nil {
 		return &CustomPacket{}, &Header{}, err
@@ -389,7 +389,7 @@ func sendPacket(ack uint32, seq uint32, flags byte, data string, udpcon *net.UDP
 		if err != nil {
 			fmt.Println(err)
 		}
-	fmt.Println("Send Packet" + string(packet))
+	//fmt.Println("Send Packet" + string(packet))
 	return len(data), err
 
 }
