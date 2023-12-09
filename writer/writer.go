@@ -15,9 +15,9 @@ import (
 
 const (
 	args = 3
-	maxRetries = 20
+	maxRetries = 60
 	maxDataLength = 512
-	packetTTL = 20
+	packetTTL = 60
 	portLimit = 65535
 )
 
@@ -78,7 +78,6 @@ type WriterFSM struct {
 	ack uint32
 	seq uint32
 	timeoutDuration time.Duration
-	//timer *time.Timer
 	mutex sync.Mutex
 	lastPacket CustomPacket
 	wg sync.WaitGroup
@@ -115,7 +114,7 @@ func NewWriterFSM() *WriterFSM {
 		ack: 0,
 		seq: 0,
 		lastPacket: CustomPacket{},
-		timeoutDuration: 2 * time.Second,
+		timeoutDuration: 500*time.Millisecond,
 		isStdInStarted: false,
 		packetQueue: NewDQueue(),
 		packetSent: 0,
@@ -165,6 +164,7 @@ func (fsm *WriterFSM) syncronize_server_state() WriterState {
 		fsm.packetQueue.PushBack(packet)
 		select {
 			case fsm.err = <- fsm.errorChan:
+				fmt.Println("received error in syncronize server")
 				return FatalError
 			case responsePacket := <- fsm.responseChan:
 				if isValidPacket(responsePacket, FLAG_ACK, fsm.seq){
@@ -186,6 +186,8 @@ func (fsm *WriterFSM) syncronize_server_state() WriterState {
 /////////////////////////////////////////////Transmitting State////////////////////////////////////////
 
 func (fsm *WriterFSM) transmitting_state() WriterState {
+	fmt.Println("Transmitting")
+	fmt.Println("reading stdin, press ctrl + D to exit")
 	if !fsm.isStdInStarted {
 		go fsm.readStdin()
 		fsm.isStdInStarted = true
@@ -194,6 +196,7 @@ func (fsm *WriterFSM) transmitting_state() WriterState {
 	for {
 		select {
 			case <- fsm.EOFchan:
+				fmt.Println("EOF received from standard input")
 				return Termination
 			case fsm.err = <- fsm.errorChan:
 				return ErrorHandling
@@ -224,6 +227,7 @@ func (fsm *WriterFSM) fatal_error_state() WriterState {
 
 
 func (fsm *WriterFSM) terminate_state() WriterState {
+	fmt.Println("Terminating")
 	fsm.stopSendPacketChan <- struct{}{}
 	fmt.Println("closing go routines")
 
@@ -285,7 +289,6 @@ func (fsm *WriterFSM) Run() {
 /////////////////////////go routines for FSM////////////////////////////
 
 func (fsm *WriterFSM) readStdin() {
-	fmt.Println("reading stdin, press ctrl + D to exit")
 	for {
 		inputBuffer := make([]byte, maxDataLength)
 		n, err := fsm.stdinReader.Read(inputBuffer)
@@ -314,15 +317,16 @@ func (fsm *WriterFSM) listenResponse(timout time.Duration) {
 		case <-fsm.stopListenResponseChan:
 			return
 		default:
-			fsm.udpcon.SetReadDeadline(time.Now().Add(500*time.Millisecond))
+			fsm.udpcon.SetReadDeadline(time.Now().Add(300*time.Millisecond))
 			buffer := make([]byte, maxDataLength)
 			n, err := fsm.udpcon.Read(buffer)
 			if err != nil {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 					continue
 				} else {
+					fmt.Println("listenResponse get error")
 					fsm.errorChan <- err
-						return
+
 				}
 			}
 			if n > 0 {
@@ -347,15 +351,16 @@ func (fsm *WriterFSM) listenResponse(timout time.Duration) {
 
 func (fsm *WriterFSM) sendPacket() {
 	defer fmt.Println("sending packet closed")
+
 	defer fsm.wg.Done()
 	shouldStop := false
 
 	for {
 		select {
 			case <- fsm.stopSendPacketChan:
+				//fmt.Println("stop sending packet signal received")
 				if !shouldStop {
 					shouldStop = true
-					fmt.Println("Receive EOF from keyboard")
 				}
 
 			default:
@@ -371,8 +376,8 @@ func (fsm *WriterFSM) sendPacket() {
 					_, err := fsm.udpcon.Write(packet)
 					if err != nil {
 						fsm.errorChan <- err
-						return
 					}
+
 					fsm.packetSent++
 					if fsm.currentState != SyncronizeServer {
 						fsm.mutex.Lock()
