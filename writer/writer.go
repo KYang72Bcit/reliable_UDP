@@ -108,7 +108,7 @@ func NewWriterFSM() *WriterFSM {
 		currentState: Init,
 		stdinReader: bufio.NewReader(os.Stdin),
 		responseChan: make(chan []byte),
-		errorChan: make(chan error, 1),
+		errorChan: make(chan error),
 		EOFchan: make(chan struct{}),
 		stopSendPacketChan: make(chan struct{}),
 		stopListenResponseChan: make(chan struct{}),
@@ -205,7 +205,6 @@ func (fsm *WriterFSM) transmitting_state() WriterState {
 
 func (fsm *WriterFSM) error_handling_state() WriterState {
 	fmt.Println("Error:", fsm.err)
-	fsm.stopSendPacketChan <- struct{}{}
 	fsm.wg.Wait()
 	return Recover
 }

@@ -14,11 +14,11 @@ import (
 	"time"
 )
 
-/**
-	* 00000001 - ACK
-	* 00000010 - SYN
-	* 00000100 - FIN
-	* 00001000 - DATA
+/** FLAGS
+	* 00000001 - ACK -> 1
+	* 00000010 - SYN -> 2
+	* 00000100 - FIN -> 4
+	* 00001000 - DATA -> 8
 **/
 
 const (
@@ -50,6 +50,7 @@ type Header struct {
 	DataLen uint32 `json:"dataLen"`	
 }
 
+//////////////////define Statistics structure /////////////////////
 type Statistics struct {
 	TimeStamp string
 	PacketSent int
@@ -256,7 +257,7 @@ func (fsm *ReceiverFSM) listenResponse() {
 	}	
 }
 
-
+/// go routine for confirming the packet
 func (fsm *ReceiverFSM) confirmPacket() {
 	defer fsm.wg.Done()
 	for {
@@ -291,7 +292,7 @@ func (fsm *ReceiverFSM) confirmPacket() {
 
 }
 
-
+/// go routine for printing the packet to console
 func (fsm *ReceiverFSM) printToConsole() {
 	defer fsm.wg.Done()
 	for {
@@ -304,7 +305,7 @@ func (fsm *ReceiverFSM) printToConsole() {
 	}
 }
 
-
+/// go routine for recording the statistics
 func (fsm *ReceiverFSM) recordStatistics() {
 	start := time.Now()
 	for {
@@ -328,7 +329,7 @@ func (fsm *ReceiverFSM) recordStatistics() {
 }
 
 
-
+/// go routine for handling Ctrl+C
 func (fsm *ReceiverFSM) handleQuit() {
 		<- fsm.quitChan
 		fmt.Println("Received Ctrl+C, shutting down...")
