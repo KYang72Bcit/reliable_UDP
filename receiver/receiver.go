@@ -30,6 +30,8 @@ const (
 
 const (
 	args = 3
+	optionalGUIArgs = 5
+	optionalIntervalArgs = 6
 	bufferSize = 1024
 	packetBufferSize = 50
 	timeoutDuration	= 200 * time.Millisecond
@@ -65,6 +67,7 @@ type ReceiverState int
 const (
 	Init ReceiverState = iota
 	CreateSocket
+	SetGUIConnction
 	ReadyForReceiving
 	Receiving
 	Recover
@@ -78,6 +81,9 @@ type ReceiverFSM struct {
 	err error
 	ip net.IP
 	port int
+	guiIP net.IP
+	guiPort int
+	guicon net.Conn
 	udpcon *net.UDPConn
 	seqNum uint32
 	ackNum uint32
@@ -88,6 +94,7 @@ type ReceiverFSM struct {
 	quitChan chan os.Signal
 	wg sync.WaitGroup
 	clientAddr *net.UDPAddr
+	timeInterval int
 	packetSent int
 	packetReceived int
 	correctPacket int
@@ -116,17 +123,38 @@ func NewReceiverFSM() *ReceiverFSM {
 func (fsm *ReceiverFSM) init_state() ReceiverState {
 	signal.Notify(fsm.quitChan, syscall.SIGINT)
 	go fsm.handleQuit()
-	if (len(os.Args) != args) {
-		fsm.err = errors.New("invalid number of arguments, <ip> <port>")
+	if (len(os.Args) != args || len(os.Args) != optionalGUIArgs || len(os.Args) != optionalIntervalArgs) {
+
+		fsm.err = errors.New("invalid number of arguments, <IP> <port> [gui IP] [gui port] [transmission interval(milliseconds)]")
 		return FatalError
 	}
+
 	fsm.ip, fsm.err = validateIP(os.Args[1])
 	if fsm.err != nil {
 		return FatalError
 	}
+
 	fsm.port, fsm.err = validatePort(os.Args[2])
 	if fsm.err != nil {
 		return FatalError
+	}
+
+	if len(os.Args) == optionalGUIArgs || len(os.Args) == optionalIntervalArgs {
+		fsm.guiIP, fsm.err = validateIP(os.Args[3])
+		if fsm.err != nil {
+			return FatalError
+		}
+		fsm.guiPort, fsm.err = validatePort(os.Args[4])
+		if fsm.err != nil {
+			return FatalError
+		}
+	}
+
+	if len(os.Args) == optionalIntervalArgs {
+		fsm.timeInterval, fsm.err = strconv.Atoi(os.Args[5])
+		if fsm.err != nil {
+			return FatalError
+		}
 	}
 	return CreateSocket
 }
@@ -141,11 +169,20 @@ func (fsm *ReceiverFSM) create_socket_state() ReceiverState {
 	}
 	
 	fmt.Println("UDP server listening on", fsm.udpcon.LocalAddr().String())
-	return ReadyForReceiving
+	return SetGUIConnction
 }
 
-func (fsm *ReceiverFSM) ready_for_receiving_state() ReceiverState {
-	go fsm.recordStatistics()	
+func (fsm *ReceiverFSM) set_gui_connection_state() ReceiverState {
+	fmt.Println("Setting GUI connection")
+	fsm.guicon, fsm.err = net.Dial("tcp", fsm.guiIP.String() + ":" + strconv.Itoa(fsm.guiPort))
+	if fsm.err != nil {
+		return FatalError
+	}
+
+	go fsm.recordStatistics(fsm.timeInterval)
+	return ReadyForReceiving
+}
+func (fsm *ReceiverFSM) ready_for_receiving_state() ReceiverState {	
 	fsm.wg.Add(3)
 	go fsm.printToConsole()
 	go fsm.listenResponse()
@@ -198,6 +235,10 @@ func (fsm *ReceiverFSM) termination_state() {
 	if fsm.udpcon != nil{
 		fsm.udpcon.Close()
 	}	
+
+	if fsm.guicon != nil {
+		fsm.guicon.Close()
+	}
 	fmt.Println("UDP server exiting...")	
 }
 
@@ -208,6 +249,8 @@ func (fsm *ReceiverFSM) Run() {
 				fsm.currentState = fsm.init_state()
 			case CreateSocket:
 				fsm.currentState = fsm.create_socket_state()
+			case SetGUIConnction:
+				fsm.currentState = fsm.set_gui_connection_state()
 			case ReadyForReceiving:
 				fsm.currentState = fsm.ready_for_receiving_state()
 			case Receiving:
@@ -305,8 +348,8 @@ func (fsm *ReceiverFSM) printToConsole() {
 	}
 }
 
-/// go routine for recording the statistics
-func (fsm *ReceiverFSM) recordStatistics() {
+/// go routine for recording the statistics and send to GUI
+func (fsm *ReceiverFSM) recordStatistics(timeinterval int) {
 	start := time.Now()
 	for {
 		elapsed := int(time.Since(start).Seconds())
@@ -322,7 +365,13 @@ func (fsm *ReceiverFSM) recordStatistics() {
 		}
 
 		statistics = append(statistics, statistic)
-		time.Sleep(5 * time.Second)
+		if fsm.guicon != nil {
+			err := json.NewEncoder(fsm.guicon).Encode(statistic)
+			if err != nil {
+			return
+			}
+		}
+		time.Sleep(time.Duration(timeinterval) * time.Millisecond)
 
 	}
 

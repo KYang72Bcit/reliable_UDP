@@ -17,6 +17,8 @@ import (
 
 const (
 	args = 3
+	optionalGUIArgs = 5
+	optionalIntervalArgs = 6
 	maxRetries = 64
 	maxDataLength = 216
 	packetTTL = 64
@@ -57,9 +59,9 @@ type Header struct {
 type Statistics struct {
 	TimeStamp string
 	PacketSent int
-	PacketReceived int
 	PacketAcked int
 }
+
 
 
 
@@ -70,7 +72,10 @@ type WriterFSM struct {
 	currentState WriterState
 	ip net.IP
 	port int
+	guiIP net.IP
+	guiPort int
 	udpcon *net.UDPConn
+	guicon net.Conn
 	stdinReader *bufio.Reader
 	quitChan chan os.Signal //channel for quit signal handling
 	EOFchan chan struct{} //channel for EOF signal handling
@@ -81,6 +86,7 @@ type WriterFSM struct {
 	ack uint32
 	seq uint32
 	timeoutDuration time.Duration
+	timeInterval int
 	mutex sync.Mutex
 	lastPacket CustomPacket
 	wg sync.WaitGroup
@@ -89,12 +95,13 @@ type WriterFSM struct {
 	isLastPacketACKReceived bool
 	packetQueue *DQueue
 	packetSent int
-	packetReceived int
+	packetAcked int
 }
 
 const (
 	Init WriterState = iota
 	CreateSocket
+	SetGUIConnction
 	SyncronizeServer
 	Transmitting
 	Recover
@@ -119,20 +126,21 @@ func NewWriterFSM() *WriterFSM {
 		seq: 0,
 		lastPacket: CustomPacket{},
 		timeoutDuration: 500*time.Millisecond,
+		timeInterval: 10000,
 		isGoroutinesStarted: false,
 		isStdInStarted: false,
 		packetQueue: NewDQueue(),
 		packetSent: 0,
-		packetReceived: 0,
+		packetAcked: 0,
 	}
 }
 
 func (fsm *WriterFSM) init_State() WriterState {
 	fmt.Println("Initializing")
 	signal.Notify(fsm.quitChan, syscall.SIGINT)
-	if (len(os.Args) != args) {
+	if (len(os.Args) != args || len(os.Args) != optionalGUIArgs || len(os.Args) != optionalIntervalArgs) {
 
-		fsm.err = errors.New("invalid number of arguments, <ip> <port>")
+		fsm.err = errors.New("invalid number of arguments, <IP> <port> [gui IP] [gui port] [transmission interval (milliseconds)]")
 		return FatalError
 	}
 
@@ -145,6 +153,24 @@ func (fsm *WriterFSM) init_State() WriterState {
 	if fsm.err != nil {
 		return FatalError
 	}
+
+	if len(os.Args) == optionalGUIArgs || len(os.Args) == optionalIntervalArgs {
+		fsm.guiIP, fsm.err = validateIP(os.Args[3])
+		if fsm.err != nil {
+			return FatalError
+		}
+		fsm.guiPort, fsm.err = validatePort(os.Args[4])
+		if fsm.err != nil {
+			return FatalError
+		}
+	}
+
+	if len(os.Args) == optionalIntervalArgs {
+		fsm.timeInterval, fsm.err = strconv.Atoi(os.Args[5])
+		if fsm.err != nil {
+			return FatalError
+		}
+	}
 	return CreateSocket
 }
 
@@ -156,14 +182,29 @@ func (fsm *WriterFSM) create_socket_state() WriterState {
 	if fsm.err != nil {
 		return FatalError
 	}
+	if fsm.guiIP != nil && fsm.guiPort != 0 {
+		return SetGUIConnction
+	}
+	return SyncronizeServer
+}
+
+func (fsm *WriterFSM) set_gui_connection_state() WriterState {
+	fmt.Println("Setting GUI connection")
+	fsm.guicon, fsm.err = net.Dial("tcp", fsm.guiIP.String() + ":" + strconv.Itoa(fsm.guiPort))
+	if fsm.err != nil {
+		return FatalError
+	}
+	go fsm.recordStatistics(fsm.timeInterval)
 	return SyncronizeServer
 }
 
 func (fsm *WriterFSM) syncronize_server_state() WriterState {
 	fmt.Println("Syncronizing server")
 	fsm.isGoroutinesStarted = true
+	if fsm.guicon == nil {
+		go fsm.recordStatistics(fsm.timeInterval)
+	}
 	fsm.wg.Add(2)
-	go fsm.recordStatistics()
 	go fsm.listenResponse(fsm.timeoutDuration)
 	go fsm.sendPacket()
 	for i := 0; i < maxRetries; i++ {
@@ -174,6 +215,7 @@ func (fsm *WriterFSM) syncronize_server_state() WriterState {
 				return FatalError
 			case responsePacket := <- fsm.responseChan:
 				if isValidPacket(responsePacket, FLAG_ACK, fsm.seq){
+					fsm.packetAcked++
 					return Transmitting
 				} else {
 					continue
@@ -261,6 +303,10 @@ func (fsm *WriterFSM) exit_state() {
 	if fsm.udpcon != nil {
 		fsm.udpcon.Close()
 	}
+
+	if fsm.guicon != nil {
+		fsm.guicon.Close()
+	}
 	fmt.Println("Client Exiting...")
 }
 
@@ -273,6 +319,8 @@ func (fsm *WriterFSM) Run() {
 				fsm.currentState = fsm.init_State()
 			case CreateSocket:
 				fsm.currentState = fsm.create_socket_state()
+			case SetGUIConnction:
+				fsm.currentState = fsm.set_gui_connection_state()
 			case SyncronizeServer:
 				fsm.currentState = fsm.syncronize_server_state()
 			case Transmitting:
@@ -317,6 +365,7 @@ func (fsm *WriterFSM) readStdin() {
 	}
 }
 
+//go routine for listening response from server
 func (fsm *WriterFSM) listenResponse(timout time.Duration) {
 	defer fsm.wg.Done()
 	for {
@@ -337,9 +386,10 @@ func (fsm *WriterFSM) listenResponse(timout time.Duration) {
 				}
 			}
 			if n > 0 {
-				fsm.packetReceived++
+
 				if fsm.currentState != SyncronizeServer {
 					if isValidPacket(buffer[:n], FLAG_ACK, fsm.lastPacket.Header.SeqNum + fsm.lastPacket.Header.DataLen) {
+						fsm.packetAcked++
 						fsm.mutex.Lock()
 						fsm.isLastPacketACKReceived = true
 						fsm.mutex.Unlock()
@@ -360,6 +410,7 @@ func (fsm *WriterFSM) handleQuit() {
 }
 
 
+//go routine for sending packets
 func (fsm *WriterFSM) sendPacket() {
 
 	defer fsm.wg.Done()
@@ -414,7 +465,8 @@ func (fsm *WriterFSM) sendPacket() {
 		}
 	}
 
-	func (fsm *WriterFSM) recordStatistics() {
+	//go routine for recording statistics and send to GUI
+	func (fsm *WriterFSM) recordStatistics(timeInterval int) {
 		start := time.Now()
 		for {
 			elapsed := int(time.Since(start).Seconds())
@@ -425,12 +477,18 @@ func (fsm *WriterFSM) sendPacket() {
 			statistic := Statistics{
 				TimeStamp: formattedTimestamp,
 				PacketSent: fsm.packetSent,
-				PacketReceived: fsm.packetReceived,
+				PacketAcked: fsm.packetAcked,
+			}
+
+			if fsm.guicon != nil {
+				err := json.NewEncoder(fsm.guicon).Encode(statistic)
+				if err != nil {
+				return
+				}
 			}
 
 			statistics = append(statistics, statistic)
-			time.Sleep(2*time.Second)
-
+			time.Sleep(time.Duration(timeInterval)*time.Millisecond)
 		}
 
 	}
@@ -470,7 +528,7 @@ func createPacket(ack uint32, seq uint32, flags byte, data string) CustomPacket 
 
 }
 
-
+//check if the received packet is valid
 func isValidPacket(response []byte, flags byte, seq uint32) bool {
 	header,  err := parsePacket(response)
 	if err != nil {
@@ -479,7 +537,7 @@ func isValidPacket(response []byte, flags byte, seq uint32) bool {
 	return header.Flags == flags && header.AckNum == seq
 }
 
-
+//parse the received packet to header
 func parsePacket(response []byte) (*Header,  error) {
 	var packet CustomPacket
 	err := json.Unmarshal(response, &packet)
@@ -489,6 +547,7 @@ func parsePacket(response []byte) (*Header,  error) {
 	return &packet.Header, nil
 }
 
+//export statistics to csv file
 func exportToCSV(statistics []Statistics) error {
 	file, err := os.Create("writer_performance.csv")
 	if err != nil {
@@ -506,7 +565,7 @@ func exportToCSV(statistics []Statistics) error {
 		record := []string{
 			stat.TimeStamp,
 			strconv.Itoa(stat.PacketSent),
-			strconv.Itoa(stat.PacketReceived),
+			strconv.Itoa(stat.PacketAcked),
 		}
 		writer.Write(record)
 	}
