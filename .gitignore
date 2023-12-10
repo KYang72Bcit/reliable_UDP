@@ -26,4 +26,6 @@ echo/
 /receiver/receiver
 # csv files
 *.csv
+/writer/*.py
+/receiver/*.py
 ```

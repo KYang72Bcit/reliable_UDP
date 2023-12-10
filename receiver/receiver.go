@@ -270,7 +270,7 @@ func (fsm *ReceiverFSM) confirmPacket() {
 				if err != nil {
 					fsm.errorChan <- err
 				}
-				fsm.packetReceived++
+	
 				if isSYNPacket(header){
 					fsm.ackNum = header.SeqNum
 				}
@@ -309,7 +309,6 @@ func (fsm *ReceiverFSM) printToConsole() {
 func (fsm *ReceiverFSM) recordStatistics() {
 	start := time.Now()
 	for {
-		time.Sleep(10 * time.Second)
 		elapsed := int(time.Since(start).Seconds())
 		elapsedTimestamp := time.Date(0, 1, 1, 0, 0, elapsed, 0, time.UTC)
 		formattedTimestamp := elapsedTimestamp.Format("04:05")
@@ -323,6 +322,7 @@ func (fsm *ReceiverFSM) recordStatistics() {
 		}
 
 		statistics = append(statistics, statistic)
+		time.Sleep(5 * time.Second)
 
 	}
 
@@ -350,7 +350,7 @@ func validateIP(ip string) (net.IP, error){
 
 func validatePort(port string) (int, error) {
 	portNo, err := strconv.Atoi(port)
-	if err != nil || portNo < 0 || portNo > 65535 {
+	if err != nil || portNo <= 0 || portNo > 65535 {
 		return -1, errors.New("invalid port number")
 	}
 	return portNo, nil
@@ -412,22 +412,15 @@ func exportToCSV(statistics []Statistics) error {
 	writer := csv.NewWriter(file)
 	defer writer.Flush()
 
-	writer.Write([]string{"Time Elapsed", "Packets Received", "Packets Sent", "Correct Packets", "Correct Rate"})
+	writer.Write([]string{"Time Elapsed", "Packets Received", "Packets Sent", "Correct Packets"})
 
 	for _, stat := range statistics {
-		var percentage string
-		if stat.PacketReceived == 0 {
-			percentage = "N/A"
-
-		} else {
-			percentage = strconv.FormatFloat(float64(stat.CorrectPacket)/float64(stat.PacketReceived)*100, 'f', 2, 64)+ "%"
-		}
+		
 		record := []string{
 			stat.TimeStamp,
 			strconv.Itoa(stat.PacketReceived),
 			strconv.Itoa(stat.PacketSent),
 			strconv.Itoa(stat.CorrectPacket),
-			percentage,
 			
 		}
 		writer.Write(record)

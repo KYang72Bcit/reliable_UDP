@@ -8,16 +8,18 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/signal"
 	"strconv"
 	"sync"
+	"syscall"
 	"time"
 )
 
 const (
 	args = 3
-	maxRetries = 60
-	maxDataLength = 512
-	packetTTL = 60
+	maxRetries = 64
+	maxDataLength = 216
+	packetTTL = 64
 	portLimit = 65535
 )
 
@@ -70,6 +72,7 @@ type WriterFSM struct {
 	port int
 	udpcon *net.UDPConn
 	stdinReader *bufio.Reader
+	quitChan chan os.Signal //channel for quit signal handling
 	EOFchan chan struct{} //channel for EOF signal handling
 	responseChan chan []byte //channel for response handling
 	errorChan chan error //channel for error handling between go routines
@@ -81,12 +84,12 @@ type WriterFSM struct {
 	mutex sync.Mutex
 	lastPacket CustomPacket
 	wg sync.WaitGroup
+	isGoroutinesStarted bool
 	isStdInStarted bool
 	isLastPacketACKReceived bool
 	packetQueue *DQueue
 	packetSent int
 	packetReceived int
-	packetAcked int
 }
 
 const (
@@ -111,20 +114,22 @@ func NewWriterFSM() *WriterFSM {
 		EOFchan: make(chan struct{}),
 		stopSendPacketChan: make(chan struct{}),
 		stopListenResponseChan: make(chan struct{}),
+		quitChan: make(chan os.Signal, 1),
 		ack: 0,
 		seq: 0,
 		lastPacket: CustomPacket{},
 		timeoutDuration: 500*time.Millisecond,
+		isGoroutinesStarted: false,
 		isStdInStarted: false,
 		packetQueue: NewDQueue(),
 		packetSent: 0,
 		packetReceived: 0,
-		packetAcked: 0,
 	}
 }
 
 func (fsm *WriterFSM) init_State() WriterState {
 	fmt.Println("Initializing")
+	signal.Notify(fsm.quitChan, syscall.SIGINT)
 	if (len(os.Args) != args) {
 
 		fsm.err = errors.New("invalid number of arguments, <ip> <port>")
@@ -144,6 +149,7 @@ func (fsm *WriterFSM) init_State() WriterState {
 }
 
 func (fsm *WriterFSM) create_socket_state() WriterState {
+	go fsm.handleQuit()
 	fmt.Println("Creating socket")
 	addr := &net.UDPAddr{IP: fsm.ip, Port: fsm.port}
 	fsm.udpcon, fsm.err = net.DialUDP("udp", nil, addr)
@@ -155,6 +161,7 @@ func (fsm *WriterFSM) create_socket_state() WriterState {
 
 func (fsm *WriterFSM) syncronize_server_state() WriterState {
 	fmt.Println("Syncronizing server")
+	fsm.isGoroutinesStarted = true
 	fsm.wg.Add(2)
 	go fsm.recordStatistics()
 	go fsm.listenResponse(fsm.timeoutDuration)
@@ -164,11 +171,9 @@ func (fsm *WriterFSM) syncronize_server_state() WriterState {
 		fsm.packetQueue.PushBack(packet)
 		select {
 			case fsm.err = <- fsm.errorChan:
-				fmt.Println("received error in syncronize server")
 				return FatalError
 			case responsePacket := <- fsm.responseChan:
 				if isValidPacket(responsePacket, FLAG_ACK, fsm.seq){
-					fsm.packetAcked++
 					return Transmitting
 				} else {
 					continue
@@ -196,7 +201,6 @@ func (fsm *WriterFSM) transmitting_state() WriterState {
 	for {
 		select {
 			case <- fsm.EOFchan:
-				fmt.Println("EOF received from standard input")
 				return Termination
 			case fsm.err = <- fsm.errorChan:
 				return ErrorHandling
@@ -221,7 +225,10 @@ func (fsm *WriterFSM) recover_state() WriterState {
 
 func (fsm *WriterFSM) fatal_error_state() WriterState {
 	fmt.Println("Fatal Error:", fsm.err)
-	return Termination
+	if fsm.isGoroutinesStarted{
+		return Termination
+	}
+	return Exit
 }
 
 
@@ -229,7 +236,6 @@ func (fsm *WriterFSM) fatal_error_state() WriterState {
 func (fsm *WriterFSM) terminate_state() WriterState {
 	fmt.Println("Terminating")
 	fsm.stopSendPacketChan <- struct{}{}
-	fmt.Println("closing go routines")
 
 
 	done := make(chan struct{})
@@ -242,9 +248,7 @@ func (fsm *WriterFSM) terminate_state() WriterState {
 		select {
 		case <-done:
 			fmt.Println("all goroutines closed")
-			if fsm.udpcon != nil {
-				fsm.udpcon.Close()
-			}
+			fsm.udpcon.Close()
 			return Exit
 		case err := <-fsm.errorChan:
 			fmt.Println("Error:", err)
@@ -254,6 +258,9 @@ func (fsm *WriterFSM) terminate_state() WriterState {
 
 
 func (fsm *WriterFSM) exit_state() {
+	if fsm.udpcon != nil {
+		fsm.udpcon.Close()
+	}
 	fmt.Println("Client Exiting...")
 }
 
@@ -294,6 +301,7 @@ func (fsm *WriterFSM) readStdin() {
 		n, err := fsm.stdinReader.Read(inputBuffer)
 		if err != nil {
 			if err.Error() == "EOF" {
+				fmt.Println("EOF received from standard input")
 				fsm.EOFchan <- struct{}{}
 				return
 			}
@@ -310,7 +318,6 @@ func (fsm *WriterFSM) readStdin() {
 }
 
 func (fsm *WriterFSM) listenResponse(timout time.Duration) {
-	defer fmt.Println("listening to response closed")
 	defer fsm.wg.Done()
 	for {
 		select {
@@ -335,7 +342,6 @@ func (fsm *WriterFSM) listenResponse(timout time.Duration) {
 					if isValidPacket(buffer[:n], FLAG_ACK, fsm.lastPacket.Header.SeqNum + fsm.lastPacket.Header.DataLen) {
 						fsm.mutex.Lock()
 						fsm.isLastPacketACKReceived = true
-						fsm.packetAcked++
 						fsm.mutex.Unlock()
 					}
 
@@ -347,10 +353,14 @@ func (fsm *WriterFSM) listenResponse(timout time.Duration) {
 		}
 	}
 }
+func (fsm *WriterFSM) handleQuit() {
+	<-fsm.quitChan
+	fmt.Println("Ctrl + C received")
+	fsm.EOFchan <- struct{}{}
+}
 
 
 func (fsm *WriterFSM) sendPacket() {
-	defer fmt.Println("sending packet closed")
 
 	defer fsm.wg.Done()
 	shouldStop := false
@@ -358,7 +368,6 @@ func (fsm *WriterFSM) sendPacket() {
 	for {
 		select {
 			case <- fsm.stopSendPacketChan:
-				//fmt.Println("stop sending packet signal received")
 				if !shouldStop {
 					shouldStop = true
 				}
@@ -408,7 +417,6 @@ func (fsm *WriterFSM) sendPacket() {
 	func (fsm *WriterFSM) recordStatistics() {
 		start := time.Now()
 		for {
-			time.Sleep(10 * time.Second)
 			elapsed := int(time.Since(start).Seconds())
 			elapsedTimestamp := time.Date(0, 1, 1, 0, 0, elapsed, 0, time.UTC)
 			formattedTimestamp := elapsedTimestamp.Format("04:05")
@@ -418,10 +426,10 @@ func (fsm *WriterFSM) sendPacket() {
 				TimeStamp: formattedTimestamp,
 				PacketSent: fsm.packetSent,
 				PacketReceived: fsm.packetReceived,
-				PacketAcked: fsm.packetAcked,
 			}
 
 			statistics = append(statistics, statistic)
+			time.Sleep(2*time.Second)
 
 		}
 
@@ -440,7 +448,7 @@ func validateIP(ip string) (net.IP, error){
 
 func validatePort(port string) (int, error) {
 	portNo, err := strconv.Atoi(port)
-	if err != nil || portNo < 0 || portNo > portLimit {
+	if err != nil || portNo <= 0 || portNo > portLimit {
 		return -1, errors.New("invalid port number")
 	}
 	return portNo, nil
@@ -491,22 +499,14 @@ func exportToCSV(statistics []Statistics) error {
 	writer := csv.NewWriter(file)
 	defer writer.Flush()
 
-	writer.Write([]string{"Time Elapsed", "Packets Sent", "Packets Received", "Packets Acked", "Acked Rate"})
+	writer.Write([]string{"Time Elapsed", "Data Sent", "ACK Received"})
 
 	for _, stat := range statistics {
-		var percentage string
-		if stat.PacketReceived == 0 {
-			percentage = "N/A"
 
-		} else {
-			percentage = strconv.FormatFloat(float64(stat.PacketAcked)/float64(stat.PacketReceived)*100, 'f', 2, 64)+ "%"
-		}
 		record := []string{
 			stat.TimeStamp,
 			strconv.Itoa(stat.PacketSent),
 			strconv.Itoa(stat.PacketReceived),
-			strconv.Itoa(stat.PacketAcked),
-			percentage,
 		}
 		writer.Write(record)
 	}
