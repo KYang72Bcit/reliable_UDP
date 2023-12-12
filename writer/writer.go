@@ -57,9 +57,9 @@ type Header struct {
 }
 
 type Statistics struct {
-	TimeStamp string
-	PacketSent int
-	PacketAcked int
+	TimeStamp string `json:"Time Elapsed"`
+	PacketSent int  `json:"PacketSent"`
+	PacketAcked int `json:"PacketAcked"`
 }
 
 
@@ -138,7 +138,7 @@ func NewWriterFSM() *WriterFSM {
 func (fsm *WriterFSM) init_State() WriterState {
 	fmt.Println("Initializing")
 	signal.Notify(fsm.quitChan, syscall.SIGINT)
-	if (len(os.Args) != args || len(os.Args) != optionalGUIArgs || len(os.Args) != optionalIntervalArgs) {
+	if (len(os.Args) != args && len(os.Args) != optionalGUIArgs && len(os.Args) != optionalIntervalArgs) {
 
 		fsm.err = errors.New("invalid number of arguments, <IP> <port> [gui IP] [gui port] [transmission interval (milliseconds)]")
 		return FatalError
@@ -381,7 +381,9 @@ func (fsm *WriterFSM) listenResponse(timout time.Duration) {
 					continue
 				} else {
 					fmt.Println("listenResponse get error")
-					fsm.errorChan <- err
+					fsm.EOFchan <- struct{}{}
+					fsm.isGoroutinesStarted = false
+					return
 
 				}
 			}

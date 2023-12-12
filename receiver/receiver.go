@@ -54,10 +54,10 @@ type Header struct {
 
 //////////////////define Statistics structure /////////////////////
 type Statistics struct {
-	TimeStamp string
-	PacketSent int
-	PacketReceived int
-	CorrectPacket int
+	TimeStamp string `json:"Time Elapsed"`
+	PacketSent int  `json:"PacketsSent"`
+	PacketReceived int `json:"PacketsReceived"`
+	CorrectPacket int  `json:"CorrectPackets"`
 }
 
 /////////////////////////define Receiver FSM///////////////////////////
@@ -123,7 +123,7 @@ func NewReceiverFSM() *ReceiverFSM {
 func (fsm *ReceiverFSM) init_state() ReceiverState {
 	signal.Notify(fsm.quitChan, syscall.SIGINT)
 	go fsm.handleQuit()
-	if (len(os.Args) != args || len(os.Args) != optionalGUIArgs || len(os.Args) != optionalIntervalArgs) {
+	if (len(os.Args) != args && len(os.Args) != optionalGUIArgs && len(os.Args) != optionalIntervalArgs) {
 
 		fsm.err = errors.New("invalid number of arguments, <IP> <port> [gui IP] [gui port] [transmission interval(milliseconds)]")
 		return FatalError
@@ -311,7 +311,7 @@ func (fsm *ReceiverFSM) confirmPacket() {
 			case rawPacket := <- fsm.responseChan:
 				packet, header, err := parsePacket(rawPacket)
 				if err != nil {
-					fsm.errorChan <- err
+					continue
 				}
 	
 				if isSYNPacket(header){
