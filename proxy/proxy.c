@@ -115,7 +115,7 @@ int main(int argc, char *argv[]) {
     }
 
     if (fsmInstance.currentState == TERMINATE) {
-        printf("Exiting prgoram...\n");
+        printf("Exiting program...\n");
     }
 
     store_statistics("Proxy Statistics.csv", &fsmInstance);
@@ -179,6 +179,7 @@ ProxyState transition(FSM *fsm, struct pollfd fds[]) {
                 return HANDLE_ERROR;
             }
             printf("Addresses converted.\n");
+            /*
             printf("Receiver IP: %s\n", fsm->receiver_ip);
             printf("Receiver Port: %hu\n", fsm->receiver_port);
             printf("Proxy IP: %s\n", fsm->proxy_ip);
@@ -189,6 +190,7 @@ ProxyState transition(FSM *fsm, struct pollfd fds[]) {
             printf("Drop Ack Chance: %.2f%%\n", fsm->drop_ack_chance);
             printf("Delay Data Chance: %.2f%%\n", fsm->delay_data_chance);
             printf("Delay Ack Chance: %.2f%%\n\n", fsm->delay_ack_chance);
+            */
             return SOCKET_CREATE;
 
         case SOCKET_CREATE:
@@ -212,7 +214,7 @@ ProxyState transition(FSM *fsm, struct pollfd fds[]) {
                 printf("Failed to bind socket.\n");
                 return HANDLE_ERROR;
             }
-            printf("Sockets binded.\n");
+            printf("Sockets binded.\n\n");
             return WAITING_FOR_DATA;
 
         case FORWARDING_DATA:
@@ -433,7 +435,6 @@ static int socket_create(const char *ip, bool use_tcp) {
         }
     }
 
-    // Set the socket to non-blocking
     int flags = fcntl(sockfd, F_GETFL, 0);
     if (flags == -1) {
         perror("fcntl F_GETFL");
@@ -457,7 +458,7 @@ static int socket_bind(int sockfd, const char *ip, in_port_t port) {
     void *addr;
     int addr_len;
 
-    if (strchr(ip, ':') != NULL) { 
+    if (strchr(ip, ':') != NULL) {  
         memset(&addr6, 0, sizeof(addr6));
         addr6.sin6_family = AF_INET6;
         addr6.sin6_port = htons(port);
@@ -484,7 +485,7 @@ static int socket_bind(int sockfd, const char *ip, in_port_t port) {
         return -1;
     }
 
-    return 0; // Success
+    return 0; 
 }
 
 static void polling_loop(FSM *fsm, struct pollfd fds[], pthread_t stats_thread) {
@@ -559,8 +560,6 @@ static bool receive_data(FSM *fsm) {
     fsm->data_buffer[fsm->numBytes] = '\0';
     printf("Received %zd bytes: %s\n", fsm->numBytes, fsm->data_buffer);
     fsm->data_received++;
-    printf("Data received count: %d\n", fsm->data_received);
-    fflush(stdout);
 
     if (!drop_or_delay_data(fsm)) {
         return true; 
@@ -574,14 +573,12 @@ static bool drop_or_delay_data(FSM *fsm) {
     if (rand_percent < fsm->drop_data_chance) {
         printf("Data dropped.\n\n");
         fsm->data_dropped++;
-        printf("Data drop count: %d\n", fsm->data_dropped);
-        fflush(stdout);
+
         return true;
     } else if (rand_percent < fsm->drop_data_chance + fsm->delay_data_chance) {
         int delay_time_ms = (int)((rand_percent - fsm->drop_data_chance) / fsm->delay_data_chance * 1000);
         printf("Delaying data for %d ms.\n\n", delay_time_ms);
         fsm->data_delayed++;
-        printf("Data delay count: %d\n", fsm->data_delayed);
         fflush(stdout);
         usleep(delay_time_ms * 1000); 
         return false;
@@ -597,8 +594,7 @@ static bool forward_data(FSM *fsm) {
     }
 
     fsm->data_send++;
-    printf("Data send count: %d\n", fsm->data_send);
-    printf("Data Send to receiver. Bytes sent: %zd\n", numBytes);
+    printf("%zd bytes data sent to receiver.\n\n", numBytes);
     return true;
 }
 
@@ -614,8 +610,6 @@ static bool receive_ack(FSM *fsm) {
     fsm->ack_buffer[fsm->numBytes] = '\0';
     printf("Received ACK: %s\n\n", fsm->ack_buffer);
     fsm->ack_received++;
-    printf("Ack received count: %d\n", fsm->ack_received);
-    fflush(stdout);
 
     if (!drop_or_delay_ack(fsm)) {
         return true;
@@ -630,15 +624,11 @@ static bool drop_or_delay_ack(FSM *fsm) {
     if (rand_percent < fsm->drop_ack_chance) {
         printf("ACK dropped.\n\n");
         fsm->ack_dropped++;
-        printf("Ack drop count: %d\n", fsm->ack_dropped);
-        fflush(stdout);
         return true;
     } else if (rand_percent < fsm->drop_ack_chance + fsm->delay_ack_chance) {
         int delay_time_ms = (int)((rand_percent - fsm->drop_ack_chance) / fsm->delay_ack_chance * 1000);
         printf("Delaying ACK for %d ms.\n\n", delay_time_ms);
         fsm->ack_delayed++;
-        printf("Ack delay count: %d\n", fsm->ack_delayed);
-        fflush(stdout);
         usleep(delay_time_ms * 1000); 
     }
     return false;
@@ -652,34 +642,30 @@ static bool forward_ack(FSM *fsm) {
         return false;
     }
     fsm->ack_send++;
-    printf("Ack send count: %d\n", fsm->ack_send);
-    fflush(stdout);
-    printf("ACK Send to writer.\n");
+    printf("ACK Send to writer.\n\n");
     return true;
 }
 
 static int connect_to_gui(FSM *fsm) {
     printf("Attempting to connect to GUI...\n");
-    printf("GUI IP: %s\n", fsm->gui_ip);
-    printf("GUI Port: %hu\n", fsm->gui_port);
-
+    //printf("GUI IP: %s\n", fsm->gui_ip);
+    //printf("GUI Port: %hu\n", fsm->gui_port);
+    
     // Attempt to connect to the GUI
     if (connect(fsm->gui_sockfd, (struct sockaddr *)&fsm->gui_addr, fsm->gui_addr_len) < 0) {
         if (errno == EINPROGRESS) {
-            // Non-blocking mode - connection is in progress
-            printf("Connection in progress... (non-blocking mode)\n");
-            return 0; // You may want to return a special code to indicate this state
+            //printf("Connection in progress... \n");
+            return 0; 
         } else {
-            // Print detailed error message
             perror("connect to GUI failed");
             printf("Error code: %d\n", errno);
-            return -1;
+            return -1; 
         }
     }
-    printf("Connected to GUI successfully.\n");
-    return 0;
-}
 
+    printf("Connected to GUI successfully.\n");
+    return 0; 
+}
 
 static bool send_statistics_to_gui(FSM *fsm, const char *stats_message) {
     
@@ -687,13 +673,11 @@ static bool send_statistics_to_gui(FSM *fsm, const char *stats_message) {
     
     if (numBytes < 0) {
         perror("Failed to send statistics to GUI");
-        // For debugging, print the error number
         printf("Error sending to GUI, errno: %d\n", errno);
         return false;
     }
     
-    // Debugging: Print the number of bytes sent
-    printf("Sent %zd bytes to GUI. Message: %s\n", numBytes, stats_message);
+    //printf("Sent %zd bytes to GUI. Message: %s\n", numBytes, stats_message);
     return true;
 }
 
@@ -771,38 +755,21 @@ static bool store_statistics(const char *filename, FSM *fsm) {
         fsm->data_dropped,
         fsm->ack_delayed,
         fsm->ack_dropped);
-    // Call send_statistics_to_gui with the prepared message
+
     return send_statistics_to_gui(fsm, stats_message);
 }
 
 static void cleanup(FSM *fsm) {
     printf("Cleaning up and updating statistics...\n");
 
-    /*
-    // Update and store the latest statistics
-    pthread_mutex_lock(&fsm->stats_mutex);
-    store_statistics("Proxy Statistics.csv", fsm);
-    char stats_message[256];
-    snprintf(stats_message, sizeof(stats_message),
-        "Terminating. Time Elapsed: %s, Data Delayed: %d, Data Dropped: %d, ACK Delayed: %d, ACK Dropped: %d\n",
-        format_elapsed_time(difftime(time(NULL), fsm->start_time)),
-        fsm->data_delayed,
-        fsm->data_dropped,
-        fsm->ack_delayed,
-        fsm->ack_dropped);
-    send_statistics_to_gui(fsm, stats_message);
-    pthread_mutex_unlock(&fsm->stats_mutex);
-    */
-   
-    // Send a terminate message to the GUI over a TCP connection
     const char* terminate_message = "TERMINATE";
     ssize_t send_result = send(fsm->gui_sockfd, terminate_message, strlen(terminate_message), 0);
     if (send_result < 0) {
         perror("Failed to send TERMINATE message to GUI");
     } else {
-        printf("Sent TERMINATE message to GUI\n");
+        //printf("Sent TERMINATE message to GUI\n");
     }
-    // Close all sockets and perform other cleanup tasks
+
     if (fsm->writer_sockfd != -1 && fcntl(fsm->writer_sockfd, F_GETFD) != -1) {
         printf("Closing writer socket...\n");
         socket_close(fsm->writer_sockfd);
