@@ -77,13 +77,13 @@ static bool forward_data(FSM *fsm);
 static bool receive_ack(FSM *fsm); 
 static bool drop_or_delay_ack(FSM *fsm);
 static bool forward_ack(FSM *fsm);
+static int connect_to_gui(FSM *fsm);
+static bool send_statistics_to_gui(FSM *fsm, const char *stats_message);
 const char* format_elapsed_time(double elapsed_seconds);
 static void* write_statistics_periodically(void *arg);
 static bool store_statistics(const char *filename, FSM *fsm); 
 static void cleanup(FSM *fsm); 
 static int socket_close(int sockfd); 
-static int connect_to_gui(FSM *fsm);
-static bool send_statistics_to_gui(FSM *fsm, const char *stats_message);
 
 int main(int argc, char *argv[]) {
     FSM fsmInstance;
@@ -680,7 +680,6 @@ static bool send_statistics_to_gui(FSM *fsm, const char *stats_message) {
     //printf("Sent %zd bytes to GUI. Message: %s\n", numBytes, stats_message);
     return true;
 }
-
 
 const char* format_elapsed_time(double elapsed_seconds) {
     static char buffer[32];

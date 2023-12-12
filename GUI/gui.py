@@ -104,10 +104,10 @@ class ServerApplication:
             time_str = '00:' + time_str
         return time_str
 
+    
     def plot_final_graph(self, df):
         numeric_columns = [
-            'Data Sent', 'Data Received', 'Correct Packets', 'ACK Sent',
-            'ACK Received', 'Data Dropped', 'Data Delayed', 'ACK Dropped', 'ACK Delayed'
+            'Data Delayed', 'Data Dropped', 'ACK Delayed', 'ACK Dropped'
         ]
         for column in numeric_columns:
             df[column] = pd.to_numeric(df[column], errors='coerce').fillna(0).astype(int)
@@ -132,7 +132,8 @@ class ServerApplication:
         ax.yaxis.set_major_locator(MaxNLocator(integer=True))  # Set the y-axis to display only integers
         ax.set_xticks(x_ticks_major) 
         ax.set_xticklabels(x_tick_labels) 
-
+        ax.set_ylim(bottom=0)
+        
         plt.xlabel('Time Elapsed (MM:SS)')
         plt.ylabel('Count')
         plt.title('Network Statistics Over Time')
@@ -140,7 +141,7 @@ class ServerApplication:
         plt.tight_layout()
         plt.grid(True)
         plt.show()
-
+    
     def format_seconds_to_mmss(self, seconds):
         """Convert seconds to MM:SS format."""
         return f"{int(seconds // 60):02d}:{int(seconds % 60):02d}"
@@ -218,8 +219,8 @@ class ServerApplication:
                 self.active_clients.remove(client_socket)
 
     def run(self):
-        print(f"Listening for incoming connections on port {self.tcp_port}")
         try:
+            print(f"Listening for incoming connections on port {self.tcp_port}")
             while not self.shutdown_flag:
                 try:
                     client_socket, addr = self.server_socket.accept()
@@ -229,21 +230,26 @@ class ServerApplication:
 
                     self.active_clients.append(client_socket)
                     client_thread = threading.Thread(target=self.handle_client_connection,
-                                                     args=(client_socket, client_ip))
+                                                    args=(client_socket, client_ip))
                     client_thread.start()
                     self.threads.append(client_thread)
 
                 except socket.timeout:
-                    continue
+                    pass
                 except Exception as e:
                     print(f"Error accepting connections: {e}")
                     break
+        except KeyboardInterrupt:
+            print("Keyboard interrupt received, shutting down server.")
+            self.shutdown_flag = True
         finally:
             self.shutdown_server()
 
     def shutdown_server(self):
         print("Shutting down server...")
-        for client in list(self.active_clients):
+        self.shutdown_flag = True
+
+        for client in self.active_clients:
             try:
                 client.sendall("TERMINATE".encode('utf-8'))
             except OSError as e:
@@ -258,21 +264,21 @@ class ServerApplication:
             self.active_clients.clear()
 
         for thread in self.threads:
-            thread.join()
+            while thread.is_alive():
+                thread.join(timeout=1.0)  
 
         with self.df_lock:
             self.df.fillna(0, inplace=True)
-            self.plot_queue.put(self.df)
-        
-        try:
-            final_df = self.plot_queue.get_nowait()
-            print("\nFinal DataFrame Statistics:")
-            print(final_df)
-            self.plot_final_graph(final_df)
-        except queue.Empty:
-            print("No data to plot.")
+            try:
+                final_df = self.plot_queue.get_nowait()
+                print("\nFinal DataFrame Statistics:")
+                print(final_df)
+                self.plot_final_graph(final_df)
+            except queue.Empty:
+                print("No data to plot.")
 
         self.server_socket.close()
+
 
 if __name__ == "__main__":
     if len(sys.argv) != 5:
