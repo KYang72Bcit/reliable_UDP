@@ -6,6 +6,7 @@ import sys
 import threading
 import queue
 import numpy as np
+from matplotlib.ticker import MaxNLocator
 
 class ServerApplication:
     def __init__(self, proxy_ip, writer_ip, receiver_ip, tcp_port):
@@ -20,13 +21,11 @@ class ServerApplication:
         self.df_lock = threading.Lock()
         self.initialize_dataframe()
 
-        # Determine if the provided addresses are IPv4 or IPv6
         self.address_family = self.determine_address_family(proxy_ip, writer_ip, receiver_ip)
 
-        # Create and configure the socket based on address family
-        if self.address_family == socket.AF_INET:  # IPv4
+        if self.address_family == socket.AF_INET:  
             self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        elif self.address_family == socket.AF_INET6:  # IPv6
+        elif self.address_family == socket.AF_INET6:  
             self.server_socket = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
             self.server_socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
 
@@ -60,6 +59,7 @@ class ServerApplication:
             return "TERMINATE"
 
         try:
+            #print("Raw message: ", message)
             message = message.strip('\n')
             parts = [part for part in message.split(", ") if ": " in part]
             stats = dict(part.split(": ", 1) for part in parts)
@@ -78,19 +78,22 @@ class ServerApplication:
 
     def parse_writer_receiver_data(self, client_name, message):
         try:
+            #print("Raw message: ", message)
             stats = json.loads(message)
-            new_row = {
-                'Data Sent': stats.get('Data Sent', 0),
-                'ACK Received': stats.get('ACK Received', 0),
-                'Data Received': stats.get('Data Received', 0),
-                'ACK Sent': stats.get('ACK Sent', 0),
-                'Correct Packets': stats.get('Correct Packets', 0),
-            }
-
-            if 'Time Elapsed' in stats:
-                time_elapsed = self.format_time(stats.get('Time Elapsed', '00:00').strip())
-                new_row['Time Elapsed'] = time_elapsed
-
+            if client_name == "Receiver":
+                new_row = {
+                    'Time Elapsed': self.format_time(stats.get('Time Elapsed', '00:00:00')),
+                    'ACK Sent': stats.get('PacketsSent', 0),
+                    'Data Received': stats.get('PacketsReceived', 0),
+                    'Correct Packets': stats.get('CorrectPackets', 0),
+                }
+            elif client_name == 'Writer': 
+                # Adjust this part if the writer sends different keys
+                new_row = {
+                    'Time Elapsed': self.format_time(stats.get('Time Elapsed', '00:00:00').strip()),
+                    'Data Sent': stats.get('PacketSent', 0),
+                    'ACK Received': stats.get('PacketAcked', 0),
+                }
             return new_row
         except json.JSONDecodeError as e:
             print(f"Error parsing writer/receiver data: {e}")
@@ -114,16 +117,21 @@ class ServerApplication:
             df.set_index('Time Elapsed', inplace=True)
 
         plt.figure(figsize=(10, 5))
+        offset = 0.0025  
+        max_value = df[numeric_columns].max().max()
+        scale = max_value * offset
+
         for i, column in enumerate(numeric_columns):
-            plt.plot(df.index, df[column], label=column, marker='o', linestyle='-')
+            y_values = df[column] + i * scale  
+            plt.plot(df.index, y_values, label=column, marker='o', linestyle='-')
 
-        # Set x-ticks to be every 10 seconds, but only label every 10 seconds
-        x_ticks_major = np.arange(0, df.index.max() + 1, 10)  # Major ticks every 10 seconds
+        x_ticks_major = np.arange(0, df.index.max() + 1, 10)  
         x_tick_labels = [self.format_seconds_to_mmss(t) for t in x_ticks_major]
-
-        ax = plt.gca()  # Get the current Axes instance
-        ax.set_xticks(x_ticks_major)  # Set major ticks
-        ax.set_xticklabels(x_tick_labels)  # Set major tick labels
+        
+        ax = plt.gca()
+        ax.yaxis.set_major_locator(MaxNLocator(integer=True))  # Set the y-axis to display only integers
+        ax.set_xticks(x_ticks_major) 
+        ax.set_xticklabels(x_tick_labels) 
 
         plt.xlabel('Time Elapsed (MM:SS)')
         plt.ylabel('Count')
@@ -190,13 +198,17 @@ class ServerApplication:
                     for client in self.active_clients:
                         client.sendall("TERMINATE".encode('utf-8'))
                     break
+                
+                if client_name == 'Proxy':
+                    new_row = self.parse_proxy_data(message)
+                else:    
+                    new_row = self.parse_writer_receiver_data(client_name, message)
+                
+                if new_row:
+                    self.update_dataframe(client_name, new_row)
                 else:
-                    new_row = self.parse_proxy_data(message) if client_name == "Proxy" else self.parse_writer_receiver_data(client_name, message)
-                    if new_row:
-                        self.update_dataframe(client_name, new_row)
-                    else:
-                        print(f"Error: Received malformed data from {client_name}")
-
+                    print(f"Error: Received malformed data from {client_name}")
+            
             except Exception as e:
                 print(f"Error receiving data from client {client_name}: {e}")
                 break
@@ -212,7 +224,6 @@ class ServerApplication:
                 try:
                     client_socket, addr = self.server_socket.accept()
                     client_ip = addr[0]
-                    print(f"IP : {client_ip}")
                     client_name = self.get_client_name(client_ip)
                     print(f"Connection from {client_name} at {client_ip}")
 
