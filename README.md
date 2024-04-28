@@ -32,3 +32,14 @@ Reliable UDP Protocol Project
 ### GUI (Python)
 - Uses the statistics file outputed from the proxy to graph
 - Graphs the data on the writer, receiver, and proxy
+
+# State Transition Diagram
+
+## receiver 
+<img width="683" alt="image" src="https://github.com/KYang72Bcit/reliable_UDP/assets/90719969/b8770e5c-6c99-494d-8468-cae02ecb091e">
+
+## writer
+<img width="695" alt="image" src="https://github.com/KYang72Bcit/reliable_UDP/assets/90719969/2ce4891f-c14a-4245-ab2f-e4e9193028ad">
+
+
+
